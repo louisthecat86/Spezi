@@ -1,0 +1,4 @@
+# Laufzeit-Abhaengigkeiten von SpeziSmith
+openpyxl>=3.1        # Vorlagen-Analyse (Lesen)
+tkinterdnd2>=0.4     # Drag & Drop (Mehrfachauswahl)
+sv-ttk>=2.6          # modernes Sun-Valley-Theme (hell/dunkel)

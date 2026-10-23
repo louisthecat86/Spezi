@@ -1,0 +1,46 @@
+name: SpeziSmith EXE bauen
+
+on:
+  workflow_dispatch:            # manuell ueber "Actions" startbar
+  push:
+    branches: [main]
+    paths: ["spezismith/**", "main.py", "requirements.txt",
+            "templates/**", "assets/**", ".github/workflows/build-exe.yml"]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhaengigkeiten installieren
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Tests
+        run: |
+          pip install pytest
+          python -m pytest tests/ -q
+
+      - name: EXE bauen
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+            --name SpeziSmith `
+            --icon assets\SpeziSmith.ico `
+            --add-data "templates;templates" `
+            --add-data "assets\logo.png;assets" `
+            --add-data "assets\icon.png;assets" `
+            --collect-all tkinterdnd2 `
+            --collect-all sv_ttk `
+            main.py
+
+      - name: Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpeziSmith.exe
+          path: dist/SpeziSmith.exe

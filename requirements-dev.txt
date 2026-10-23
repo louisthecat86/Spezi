@@ -1,0 +1,3 @@
+# Nur fuer Entwicklung/Tests/Asset-Erzeugung (nicht in der EXE noetig)
+pytest>=8
+pillow>=10

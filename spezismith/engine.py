@@ -97,8 +97,25 @@ class Rule:
     new: str
     mode: str = "set"          # "set" = ganze Zelle, "replace" = Teiltext
     find: str = ""             # Suchtext fuer mode="replace"
-    expected: str = ""         # Vorlagenwert fuer Verifikation (optional)
+    expected: str = ""         # Vorlagenwert fuer Verifikation/Inhaltssuche
     label: str = ""
+    anchor_text: str = ""      # Beschriftung neben/ueber dem Feld (Verschiebungs-Anker)
+    anchor_coord: str = ""     # Koordinate der Beschriftung in der Vorlage
+
+
+# Kopf-/Fußzeilen werden als Pseudo-Koordinaten adressiert: "HF:oddFooter.R"
+HF_PREFIX = "HF:"
+HF_PARTS = ("oddHeader", "oddFooter", "evenHeader", "evenFooter",
+            "firstHeader", "firstFooter")
+
+
+def split_hf_coord(coord: str) -> tuple[str, str]:
+    """'HF:oddFooter.R' -> ('oddFooter', 'R')."""
+    body = coord[len(HF_PREFIX):]
+    part, _, section = body.rpartition(".")
+    if part not in HF_PARTS or section.upper() not in ("L", "C", "R"):
+        raise ValueError(f"Ungueltige Kopf-/Fußzeilen-Adresse: {coord}")
+    return part, section.upper()
 
 
 @dataclass
@@ -388,7 +405,196 @@ def _cell_text(cell: ET.Element, shared: list[str]) -> str:
     return v.text if (v is not None and v.text is not None) else ""
 
 
+# ---------------------------------------------------------------------------
+# Kopf-/Fußzeile (Seitenkopf/-fuß der Spezifikation)
+# ---------------------------------------------------------------------------
+
+_HF_FONT_RE = re.compile(r'&"[^"]*"')
+_HF_SIZE_RE = re.compile(r"&\d+(?:\.\d+)?")
+_HF_COLOR_RE = re.compile(r"&[Kk][0-9A-Fa-f]{6}")
+
+
+def hf_display_text(raw: str) -> str:
+    """Lesbare Anzeige: Font-/Groessen-/Farb-Codes entfernen,
+    Feld-Codes wie &P (Seite) und &N (Seiten gesamt) behalten."""
+    text = _HF_FONT_RE.sub("", raw)
+    text = _HF_COLOR_RE.sub("", text)
+    text = _HF_SIZE_RE.sub("", text)
+    return text
+
+
+def _hf_split_sections(raw: str) -> tuple[dict[str, str], list[str]]:
+    """Zerteilt '&L...&C...&R...' in Sektionen; merkt sich die Reihenfolge."""
+    parts = re.split(r"&([LCR])", raw)
+    sections: dict[str, str] = {}
+    order: list[str] = []
+    if parts[0]:
+        sections["L"] = parts[0]  # Text ohne Marker = linker Teil
+        order.append("L")
+    for i in range(1, len(parts) - 1, 2):
+        marker, text = parts[i], parts[i + 1]
+        sections[marker] = sections.get(marker, "") + text
+        if marker not in order:
+            order.append(marker)
+    return sections, order
+
+
+def _hf_join_sections(sections: dict[str, str], order: list[str]) -> str:
+    return "".join(f"&{m}{sections[m]}" for m in order)
+
+
+def _hf_smart_replace(raw_section: str, new_text: str) -> tuple[str, str]:
+    """
+    Ersetzt den sichtbaren Text einer Kopf-/Fußzeilen-Sektion.
+    Zeilenweiser Ersatz, solange die Zeilenzahl passt - so bleiben
+    Format- und Feld-Codes (&P, &G, Schriftgroessen) exakt erhalten.
+    Liefert (neuer_rohtext, warnung).
+    """
+    old_lines = [ln for ln in hf_display_text(raw_section).split("\n") if ln.strip()]
+    new_lines = [ln for ln in new_text.replace("\r", "").split("\n") if ln.strip()]
+    if old_lines and len(old_lines) == len(new_lines):
+        out = raw_section
+        for old, new in zip(old_lines, new_lines):
+            if old not in out:
+                break
+            out = out.replace(old, new, 1)
+        else:
+            return out, ""
+    # Fallback: fuehrende Formatcodes behalten, Text komplett ersetzen
+    prefix = ""
+    m = re.match(r'^((?:&"[^"]*"|&\d+(?:\.\d+)?|&[Kk][0-9A-Fa-f]{6})+)',
+                 raw_section)
+    if m:
+        prefix = m.group(1)
+    return prefix + new_text, "Formatierung der Kopf-/Fußzeile vereinfacht"
+
+
+def get_header_footer(path: str) -> dict[str, str]:
+    """Liest Kopf-/Fußzeilen der Vorlage: 'HF:oddFooter.R' -> Anzeigetext."""
+    out: dict[str, str] = {}
+    wb = openpyxl.load_workbook(path, data_only=True)
+    try:
+        ws = wb.worksheets[0]
+        hf = {
+            "oddHeader": ws.oddHeader, "oddFooter": ws.oddFooter,
+            "evenHeader": ws.evenHeader, "evenFooter": ws.evenFooter,
+            "firstHeader": ws.firstHeader, "firstFooter": ws.firstFooter,
+        }
+        for part, obj in hf.items():
+            for section, item in (("L", obj.left), ("C", obj.center), ("R", obj.right)):
+                if item.text:
+                    out[f"{HF_PREFIX}{part}.{section}"] = hf_display_text(item.text)
+    finally:
+        wb.close()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Layout-Pruefung (Schutz gegen verschobene/falsche Vorlagen)
+# ---------------------------------------------------------------------------
+
+def layout_fingerprints(path: str) -> dict[str, str]:
+    """Alle Textzellen (Koordinate -> normalisierter Text) einer Datei."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb.worksheets[0]
+        return {
+            cell.coordinate: norm_text(cell.value)
+            for row in ws.iter_rows()
+            for cell in row
+            if isinstance(cell.value, str) and len(norm_text(cell.value)) >= 4
+        }
+    finally:
+        wb.close()
+
+
+def layout_similarity(reference: dict[str, str], other: dict[str, str]) -> float:
+    """Anteil der Vorlagen-Textzellen, die in der Datei identisch stehen."""
+    if not reference:
+        return 1.0
+    matches = sum(1 for coord, text in reference.items()
+                  if other.get(coord) == text)
+    return matches / len(reference)
+
+
 _NUM_RE = re.compile(r"^-?\d+([.,]\d+)?$")
+
+
+def _resolve_target(rule: Rule, texts: dict[str, str],
+                    anchor_of: dict[str, str]) -> tuple[str, str]:
+    """
+    Findet die Zielzelle robust, auch wenn die Datei ein verschobenes Layout hat
+    (z. B. mehr Zutaten-Zeilen als die Vorlage):
+    1. ueber den Zellinhalt selbst (Textzellen)
+    2. ueber die Beschriftung neben/ueber dem Feld + relativen Versatz
+    3. Fallback: absolute Koordinate
+    """
+    base_row, base_col = coord_key(rule.coord)
+
+    if rule.expected.strip():
+        cands = [c for c, t in texts.items()
+                 if norm_text(t) == norm_text(rule.expected)]
+        if cands:
+            cands.sort(key=lambda c: (abs(coord_key(c)[0] - base_row),
+                                      abs(coord_key(c)[1] - base_col)))
+            best = cands[0]
+            return anchor_of.get(best, best), "inhalt"
+
+    if rule.anchor_text.strip() and rule.anchor_coord:
+        a_col_s, a_row = split_coord(rule.anchor_coord)
+        a_col = col_to_idx(a_col_s)
+        t_col_s, t_row = split_coord(rule.coord)
+        d_col = col_to_idx(t_col_s) - a_col
+        d_row = t_row - a_row
+        cands = [c for c, t in texts.items()
+                 if norm_text(t) == norm_text(rule.anchor_text)]
+        if cands:
+            cands.sort(key=lambda c: (abs(coord_key(c)[0] - a_row),
+                                      abs(coord_key(c)[1] - a_col)))
+            f_col_s, f_row = split_coord(cands[0])
+            target = f"{idx_to_col(col_to_idx(f_col_s) + d_col)}{f_row + d_row}"
+            return anchor_of.get(target, target), "anker"
+
+    return anchor_of.get(rule.coord, rule.coord), "koordinate"
+
+
+def _apply_hf_rule(root: ET.Element, rule: Rule, verify: bool,
+                   result: FileResult) -> None:
+    """Wendet eine Regel auf Kopf-/Fußzeile an (z. B. 'HF:oddFooter.R')."""
+    try:
+        part, section = split_hf_coord(rule.coord)
+    except ValueError as exc:
+        result.cells.append(CellResult(
+            coord=rule.coord, label=rule.label, old="", new=rule.new,
+            status="fehler", message=str(exc)))
+        return
+    hf_el = root.find(f"{{{MAIN_NS}}}headerFooter")
+    el = hf_el.find(f"{{{MAIN_NS}}}{part}") if hf_el is not None else None
+    raw = (el.text or "") if el is not None else ""
+    if not raw:
+        result.cells.append(CellResult(
+            coord=rule.coord, label=rule.label, old="", new=rule.new,
+            status="uebersprungen",
+            message="Kopf-/Fußzeilen-Teil nicht vorhanden"))
+        return
+    sections, order = _hf_split_sections(raw)
+    sec_raw = sections.get(section, "")
+    old_plain = hf_display_text(sec_raw)
+    if verify and norm_text(old_plain) != norm_text(rule.expected):
+        result.cells.append(CellResult(
+            coord=rule.coord, label=rule.label, old=old_plain, new=rule.new,
+            status="uebersprungen",
+            message="Aktueller Text weicht vom Vorlagentext ab"))
+        return
+    if rule.mode == "replace" and rule.find and rule.find in sec_raw:
+        new_raw, note = sec_raw.replace(rule.find, rule.new), ""
+    else:
+        new_raw, note = _hf_smart_replace(sec_raw, rule.new)
+    sections[section] = new_raw
+    el.text = _hf_join_sections(sections, order)
+    result.cells.append(CellResult(
+        coord=rule.coord, label=rule.label, old=old_plain, new=rule.new,
+        status="geaendert", message=note))
 
 
 def _looks_numeric(text: str) -> bool:
@@ -485,21 +691,35 @@ def apply_to_file(
             cells_by_ref = {
                 c.get("r"): c for c in sheet_data.iter(f"{{{MAIN_NS}}}c")
             }
+            texts = {
+                ref: t for ref, c in cells_by_ref.items()
+                if (t := _cell_text(c, shared)) and norm_text(t)
+            }
+
+            via_texts = {
+                "inhalt": "per Zellinhalt gefunden",
+                "anker": "über Beschriftung gefunden",
+                "koordinate": "über Koordinate",
+            }
 
             for rule in rules:
-                coord = split_coord(rule.coord)[0].upper() + str(split_coord(rule.coord)[1])
-                coord = anchor_of.get(coord, coord)
+                if rule.coord.startswith(HF_PREFIX):
+                    _apply_hf_rule(root, rule, verify, result)
+                    continue
+
+                coord, via = _resolve_target(rule, texts, anchor_of)
                 cell = cells_by_ref.get(coord)
                 if cell is None:
                     cell = _find_or_create_cell(sheet_data, coord)
                     cells_by_ref[coord] = cell
                 old = _cell_text(cell, shared)
 
-                if verify and rule.expected and norm_text(old) != norm_text(rule.expected):
+                if verify and norm_text(old) != norm_text(rule.expected):
                     result.cells.append(CellResult(
                         coord=coord, label=rule.label, old=old, new=rule.new,
                         status="uebersprungen",
-                        message="Aktueller Wert weicht vom Vorlagenwert ab",
+                        message=("Aktueller Wert weicht vom Vorlagenwert ab"
+                                 if rule.expected else "Zielzelle ist nicht leer"),
                     ))
                     continue
 
@@ -517,7 +737,7 @@ def apply_to_file(
 
                 result.cells.append(CellResult(
                     coord=coord, label=rule.label, old=old, new=rule.new,
-                    status="geaendert",
+                    status="geaendert", message=via_texts.get(via, ""),
                 ))
 
             new_xml = _XML_DECL + ET.tostring(root, encoding="unicode")

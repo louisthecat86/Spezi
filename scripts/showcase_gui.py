@@ -26,7 +26,8 @@ def main():
 
     # Beispiel-Aenderungen, als haette der Anwender sie eingetippt
     demo = {"A5": "123456", "A6": "Ofenkäse-Schnitte 2,5 kg", "A7": "2500",
-            "J1": "Spezifikation gültig ab 01.01.2027"}
+            "J1": "Spezifikation gültig ab 01.01.2027",
+            "HF:oddFooter.R": "Datum 23.10.2026\n\n\nErsetzt 10.06.2026"}
     for coord, text in demo.items():
         if coord in app.sheet.cells:
             app.sheet.set_new_value(coord, text)

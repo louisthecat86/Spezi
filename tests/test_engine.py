@@ -254,3 +254,120 @@ def test_invalid_file_reports_error(tmp_path):
     res = apply_to_file(str(bad), str(tmp_path / "o.xlsx"), [Rule(coord="A1", new="X")])
     assert not res.ok
     assert res.error
+
+
+# ---------------------------------------------------------------------------
+# Verschiebungstoleranz, Kopf-/Fußzeile, Layout-Prüfung
+# ---------------------------------------------------------------------------
+
+# Simuliert eine Datei, bei der durch 2 Extra-Zutatenzeilen alles ab Zeile 14
+# um 2 Zeilen nach unten gerutscht ist ('Vakuum' C78 -> C80 usw.)
+SHIFTED_TEXTS = {
+    "A3": "Produktspezifizierung",
+    "A21": "Sensorik:",            # in der Vorlage: A19
+    "C78": "Anzahl Beutel je Karton",  # in der Vorlage: C76
+    "C80": "Vakuum",               # in der Vorlage: C78
+    "E80": "Atmosphäre",
+    "A1": "AULBACH GmbH & Co. KG, Industriestraße 7, 63768 Hösbach",
+}
+
+
+def test_resolve_target_anchor_shifted():
+    """'Vakuum'-Fall: Zelle hinter 'Vakuum' (D78) muss im verschobenen Layout
+    auf D80 zeigen - nicht auf 'Anzahl Beutel je Karton'."""
+    from spezismith.engine import _resolve_target
+    rule = Rule(coord="D78", new="JA", expected="",
+                anchor_text="Vakuum", anchor_coord="C78")
+    coord, via = _resolve_target(rule, SHIFTED_TEXTS, {})
+    assert coord == "D80"
+    assert via == "anker"
+
+
+def test_resolve_target_content_shifted():
+    """Textzellen werden über ihren Inhalt gefunden, egal wohin sie rutschten."""
+    from spezismith.engine import _resolve_target
+    rule = Rule(coord="A19", new="Neue Sensorik", expected="Sensorik:")
+    coord, via = _resolve_target(rule, SHIFTED_TEXTS, {})
+    assert coord == "A21"
+    assert via == "inhalt"
+
+
+def test_resolve_target_fallback_coordinate():
+    from spezismith.engine import _resolve_target
+    rule = Rule(coord="D78", new="JA")  # ohne expected/anchor
+    coord, via = _resolve_target(rule, SHIFTED_TEXTS, {})
+    assert coord == "D78"
+    assert via == "koordinate"
+
+
+def test_anchor_rule_on_real_template(tmp_path):
+    """Integration auf der echten Vorlage: D78 hinter 'Vakuum' beschreiben,
+    'Anzahl Beutel je Karton' (C76) bleibt unberuehrt."""
+    out = tmp_path / "out.xlsx"
+    rule = Rule(coord="D78", new="JA", expected="",
+                anchor_text="Vakuum", anchor_coord="C78")
+    res = apply_to_file(TPL_DE, str(out), [rule])
+    assert res.ok, res.error
+    assert res.cells[0].coord == "D78"
+    assert _read_cell(str(out), "D78") == "JA"
+    assert _read_cell(str(out), "C76") == "Anzahl Beutel je Karton"
+
+
+def test_layout_similarity():
+    from spezismith.engine import layout_fingerprints, layout_similarity
+    ref = layout_fingerprints(TPL_DE)
+    assert layout_similarity(ref, layout_fingerprints(TPL_DE)) == 1.0
+    en = layout_fingerprints(TPL_EN)
+    assert layout_similarity(ref, en) < 0.75  # andere Sprache = anderes Layout
+
+
+def test_verify_empty_expected_requires_empty_target(tmp_path):
+    """Verify + leerer Vorlagenwert = nur leere Zielzellen befuellen."""
+    out = tmp_path / "out.xlsx"
+    rule = Rule(coord="C76", new="X", expected="")  # C76 ist belegt!
+    res = apply_to_file(TPL_DE, str(out), [rule], verify=True)
+    assert res.ok
+    assert res.cells[0].status == "uebersprungen"
+    assert "nicht leer" in res.cells[0].message
+    assert _read_cell(str(out), "C76") == "Anzahl Beutel je Karton"
+
+
+def test_header_footer_read():
+    from spezismith.engine import get_header_footer
+    hf = get_header_footer(TPL_DE)
+    assert "HF:oddHeader.L" in hf
+    assert "FB_QM_005" in hf["HF:oddHeader.L"]
+    assert "&P" in hf["HF:oddHeader.L"]          # Feldcode bleibt sichtbar
+    assert "Datum 10.06.2026" in hf["HF:oddFooter.R"]
+
+
+def test_header_footer_replace_preserves_codes(tmp_path):
+    out = tmp_path / "out.xlsx"
+    rule = Rule(coord="HF:oddFooter.R",
+                new="Datum 23.10.2026\n\n\nErsetzt 10.06.2026")
+    res = apply_to_file(TPL_DE, str(out), [rule])
+    assert res.ok, res.error
+    assert res.cells[0].status == "geaendert"
+
+    import openpyxl as _opx
+    wb = _opx.load_workbook(out)
+    try:
+        text = wb.worksheets[0].oddFooter.right.text
+        assert "23.10.2026" in text
+        assert "10.06.2026" in text
+        # Seitenzahlen im Kopf unangetastet
+        assert "&P" in (wb.worksheets[0].oddHeader.left.text or "")
+    finally:
+        wb.close()
+    # XML-Rohstring: Formatcodes der Fußzeile weiterhin vorhanden
+    xml = zipfile.ZipFile(out).read("xl/worksheets/sheet1.xml").decode("utf-8")
+    assert "Arial Narrow" in xml
+    assert "23.10.2026" in xml
+
+
+def test_header_footer_missing_part(tmp_path):
+    out = tmp_path / "out.xlsx"
+    rule = Rule(coord="HF:evenFooter.R", new="X")
+    res = apply_to_file(TPL_DE, str(out), [rule])
+    assert res.ok
+    assert res.cells[0].status == "uebersprungen"

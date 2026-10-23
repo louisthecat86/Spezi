@@ -29,9 +29,12 @@ import sv_ttk
 
 from . import APP_NAME, __version__
 from .engine import (
+    HF_PREFIX,
     Rule,
     apply_to_file,
     detect_language,
+    layout_fingerprints,
+    layout_similarity,
     unique_target_path,
 )
 from .resources import (
@@ -42,7 +45,7 @@ from .resources import (
     resource_path,
     save_config,
 )
-from .sheetview import SheetView
+from .sheetview import SheetView, hf_friendly_name
 
 NAVY = "#1F2942"
 ORANGE = "#F08C21"
@@ -118,11 +121,14 @@ class SpeziSmithApp:
         self.out_dir = tk.StringVar(value=self.cfg.get("out_dir", ""))
         self.suffix = tk.StringVar(value=self.cfg.get("suffix", "_angepasst"))
         self.verify = tk.BooleanVar(value=self.cfg.get("verify", False))
+        self.layout_check = tk.BooleanVar(value=self.cfg.get("layout_check", True))
         self.replace_mode = tk.StringVar(value=self.cfg.get("replace_mode", "set"))
+        self.zoom_var = tk.StringVar(value=self.cfg.get("zoom", "100 %"))
         self.status_var = tk.StringVar(value="Bereit.")
         self.progress_var = tk.DoubleVar(value=0)
         self.counter_var = tk.StringVar(value="Keine Änderungen")
         self.lang_var = tk.StringVar(value=LANG_LABELS[self.lang])
+        self._layout_ref: dict = {}
 
         # Bearbeitungsleiste (Schritt 1)
         self.sel_coord_var = tk.StringVar(value="–")
@@ -130,6 +136,7 @@ class SpeziSmithApp:
         self.sel_new_var = tk.StringVar()
         self.sel_clear_var = tk.BooleanVar(value=False)
         self._edit_guard = False
+        self._selected_coord: str | None = None
 
         self._queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -224,6 +231,16 @@ class SpeziSmithApp:
                   foreground="#666666").pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Alle Änderungen verwerfen",
                    command=self._clear_all_changes).pack(side="left", padx=(16, 0))
+
+        ttk.Label(bar, text="Zoom:").pack(side="left", padx=(16, 2))
+        zoom_box = ttk.Combobox(bar, textvariable=self.zoom_var, width=6,
+                                state="readonly",
+                                values=["60 %", "70 %", "80 %", "90 %", "100 %",
+                                        "110 %", "125 %", "150 %"])
+        zoom_box.pack(side="left")
+        zoom_box.bind("<<ComboboxSelected>>", self._on_zoom_change)
+        ToolTip(zoom_box, "Ansicht verkleinern, um die ganze Seite zu sehen")
+
         ttk.Label(bar, textvariable=self.counter_var,
                   foreground=ORANGE, font=("Segoe UI", 10, "bold")
                   ).pack(side="right")
@@ -270,15 +287,21 @@ class SpeziSmithApp:
     def _on_cell_select(self, coord):
         if coord is None:
             self._set_edit_enabled(False)
+            self._selected_coord = None
             self.sel_coord_var.set("–")
             self.sel_orig_var.set("")
             return
+        self._selected_coord = coord
         cell = self.sheet.cells[coord]
         orig = cell.orig_text
-        self.sel_coord_var.set(coord)
+        is_hf = coord.startswith(HF_PREFIX)
+        self.sel_coord_var.set(hf_friendly_name(coord) if is_hf else coord)
         short = orig if len(orig) <= 60 else orig[:60] + "…"
         self.sel_orig_var.set(f"aktuell: {short or '(leer)'}")
-        ToolTip(self.orig_label, orig or "(leer)")
+        tip = orig or "(leer)"
+        if is_hf:
+            tip += "\n\nHinweis: &P = Seitenzahl, &N = Seiten gesamt, &G = Grafik"
+        ToolTip(self.orig_label, tip)
         self._edit_guard = True
         self.sel_new_var.set(cell.new_text or "")
         self.sel_clear_var.set(cell.new_text == "")
@@ -289,7 +312,7 @@ class SpeziSmithApp:
         self.new_entry.focus_set()
 
     def _current_coord(self):
-        coord = self.sel_coord_var.get()
+        coord = self._selected_coord
         return coord if coord in self.sheet.cells else None
 
     def _on_new_value_typed(self, *_):
@@ -405,7 +428,16 @@ class SpeziSmithApp:
         verify_cb.pack(side="left", padx=(20, 0))
         ToolTip(verify_cb, "Sicherheitsoption: Zellen, deren Inhalt in der "
                            "abgelegten Spezifikation vom Vorlagenwert abweicht, "
-                           "werden übersprungen und im Log gemeldet.")
+                           "werden übersprungen und im Log gemeldet. Leere "
+                           "Eingabefelder werden nur befüllt, wenn sie in der "
+                           "Zieldatei leer sind.")
+        layout_cb = ttk.Checkbutton(
+            opt, text="Layout-Prüfung (empfohlen)", variable=self.layout_check)
+        layout_cb.pack(side="left", padx=(20, 0))
+        ToolTip(layout_cb, "Prüft jede abgelegte Datei vor dem Ersetzen: Weicht "
+                           "ihr Layout deutlich von der Vorlage ab (z. B. andere "
+                           "Zeilenanzahl), wird sie übersprungen statt falsch "
+                           "befüllt - mit Warnung im Log.")
         frame.columnconfigure(1, weight=1)
 
     # ------------------------------------------------------------------
@@ -515,11 +547,23 @@ class SpeziSmithApp:
         rel = TEMPLATE_DE if self.lang == LANG_DE else TEMPLATE_EN
         return resource_path(rel)
 
+    def _zoom_scale(self) -> float:
+        try:
+            return max(40, min(200, int(self.zoom_var.get().rstrip(" %")))) / 100
+        except ValueError:
+            return 1.0
+
+    def _on_zoom_change(self, _event=None):
+        self._load_template(preserve=self.sheet.changed())
+        self._save_cfg()
+
     def _load_template(self, preserve: dict):
         self.status_var.set("Analysiere Vorlage…")
         self.root.update_idletasks()
         try:
-            count = self.sheet.load_template(self._template_path(), keep=preserve)
+            count = self.sheet.load_template(self._template_path(), keep=preserve,
+                                             scale=self._zoom_scale())
+            self._layout_ref = layout_fingerprints(self._template_path())
         except Exception as exc:
             messagebox.showerror(APP_NAME,
                                  f"Vorlage konnte nicht gelesen werden:\n{exc}")
@@ -542,10 +586,17 @@ class SpeziSmithApp:
         mode = self.replace_mode.get()
         for coord, new in self.sheet.changed().items():
             orig = self.sheet.orig_value(coord)
+            anchor_text, anchor_coord = self.sheet.anchor_of(coord)
+            if coord.startswith(HF_PREFIX):
+                label = hf_friendly_name(coord)
+                mode = "set"  # Kopf-/Fußzeile: format-schonender Volltext-Ersatz
+            else:
+                label = orig[:40] or coord
             rules.append(Rule(
                 coord=coord, new=new, mode=mode,
                 find=orig, expected=orig,
-                label=orig[:40] or coord,
+                label=label,
+                anchor_text=anchor_text, anchor_coord=anchor_coord,
             ))
         return rules
 
@@ -614,11 +665,13 @@ class SpeziSmithApp:
 
         self._worker = threading.Thread(
             target=self._batch_worker,
-            args=(files, rules, out_dir, self.suffix.get(), self.verify.get()),
+            args=(files, rules, out_dir, self.suffix.get(), self.verify.get(),
+                  self.layout_check.get(), self._layout_ref),
             daemon=True)
         self._worker.start()
 
-    def _batch_worker(self, files, rules, out_dir, suffix, verify):
+    def _batch_worker(self, files, rules, out_dir, suffix, verify,
+                      layout_check, layout_ref):
         errors = []
         for i, src in enumerate(files, start=1):
             lang = detect_language(src)
@@ -626,23 +679,35 @@ class SpeziSmithApp:
                 self._queue.put(("log", os.path.basename(src), "warn",
                                  f"Sprache passt nicht zur Auswahl "
                                  f"({LANG_LABELS.get(lang, lang)}) – übersprungen", ""))
-            else:
-                target = unique_target_path(out_dir, os.path.basename(src), suffix)
-                res = apply_to_file(src, target, rules, verify=verify)
-                if res.ok:
-                    msg = f"{res.changed_count} Feld(er) geändert"
-                    if res.skipped_count:
-                        msg += f", {res.skipped_count} übersprungen"
-                    self._queue.put(("log", os.path.basename(src), "ok", msg, target))
+            elif layout_check and layout_ref:
+                sim = layout_similarity(layout_ref, layout_fingerprints(src))
+                if sim < 0.75:
+                    self._queue.put(("log", os.path.basename(src), "warn",
+                                     f"Layout weicht ab (nur {sim:.0%} Übereinstimmung"
+                                     f" mit der Vorlage) – übersprungen", ""))
                 else:
-                    errors.append(f"{os.path.basename(src)}: {res.error}")
-                    self._queue.put(("log", os.path.basename(src), "err",
-                                     f"Fehler: {res.error}", ""))
+                    self._apply_one(src, out_dir, suffix, rules, verify, errors)
+            else:
+                self._apply_one(src, out_dir, suffix, rules, verify, errors)
             self._queue.put(("progress", i))
         self._queue.put(("done", len(files), errors))
 
+    def _apply_one(self, src, out_dir, suffix, rules, verify, errors):
+        target = unique_target_path(out_dir, os.path.basename(src), suffix)
+        res = apply_to_file(src, target, rules, verify=verify)
+        if res.ok:
+            msg = f"{res.changed_count} Feld(er) geändert"
+            if res.skipped_count:
+                msg += f", {res.skipped_count} übersprungen"
+            self._queue.put(("log", os.path.basename(src), "ok", msg, target))
+        else:
+            errors.append(f"{os.path.basename(src)}: {res.error}")
+            self._queue.put(("log", os.path.basename(src), "err",
+                             f"Fehler: {res.error}", ""))
+
     def _process_with_dialogs(self, files: list[str], rules: list[Rule]):
         errors = []
+        layout_check = self.layout_check.get()
         for i, src in enumerate(files, start=1):
             name = os.path.basename(src)
             lang = detect_language(src)
@@ -651,6 +716,13 @@ class SpeziSmithApp:
                           f"Sprache passt nicht zur Auswahl "
                           f"({LANG_LABELS.get(lang, lang)}) – übersprungen", "")
                 continue
+            if layout_check and self._layout_ref:
+                sim = layout_similarity(self._layout_ref, layout_fingerprints(src))
+                if sim < 0.75:
+                    self._log(name, "warn",
+                              f"Layout weicht ab (nur {sim:.0%} Übereinstimmung "
+                              f"mit der Vorlage) – übersprungen", "")
+                    continue
             stem, ext = os.path.splitext(name)
             target = filedialog.asksaveasfilename(
                 parent=self.root, title=f"Geänderte Spezifikation speichern: {name}",
@@ -747,7 +819,9 @@ class SpeziSmithApp:
             "out_dir": self.out_dir.get(),
             "suffix": self.suffix.get(),
             "verify": self.verify.get(),
+            "layout_check": self.layout_check.get(),
             "replace_mode": self.replace_mode.get(),
+            "zoom": self.zoom_var.get(),
         })
 
     def run(self):

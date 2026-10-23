@@ -1,10 +1,13 @@
 """
 SpeziSmith - SheetView
 
-Maßstabsgetreue, klickbare Nachbildung der Spezifikations-Vorlage:
+Maßstabsgetreue, klickbare Nachbildung der Spezifikations-Vorlage als
+**ganze Seite**: Seitenkopf und -fuß (Kopf-/Fußzeile) werden wie im
+Ausdruck oben bzw. unten dargestellt und sind ebenfalls wählbar.
 Spaltenbreiten, Zeilenhöhen, verbundene Zellen, Schrift- und Füllfarben
-werden aus der Excel-Datei übernommen. Ein Klick auf ein Feld wählt es aus,
-eingetragene Änderungen werden direkt im Layout sichtbar (WYSIWYG).
+kommen aus der Excel-Datei; Seitenumbrüche werden als gestrichelte Linien
+eingeblendet. Zoombar. Ein Klick auf ein Feld wählt es aus, eingetragene
+Änderungen werden direkt im Layout sichtbar (WYSIWYG).
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ from typing import Callable, Optional
 
 import openpyxl
 
-from .engine import idx_to_col
+from .engine import HF_PREFIX, hf_display_text, idx_to_col
 
 ORANGE = "#F08C21"
 NAVY = "#1F2942"
@@ -24,19 +27,38 @@ CHANGED_BG = "#FFE3C2"
 MATCH_BG = "#FFF59D"
 HEADER_BG = "#E9EDF3"
 GRID_COLOR = "#B9BFC9"
+HF_BG = "#F7F9FC"
 
 ROW_HEADER_W = 44
 COL_HEADER_H = 22
 DEFAULT_COL_WIDTH = 8.43   # Excel-Standardbreite
 DEFAULT_ROW_HEIGHT = 16.5  # Punkte
 
+HF_PART_NAMES = {
+    "oddHeader": "Kopfzeile", "oddFooter": "Fußzeile",
+    "evenHeader": "Kopfzeile (gerade Seiten)",
+    "evenFooter": "Fußzeile (gerade Seiten)",
+    "firstHeader": "Kopfzeile (1. Seite)",
+    "firstFooter": "Fußzeile (1. Seite)",
+}
+HF_SECTION_NAMES = {"L": "links", "C": "mittig", "R": "rechts"}
 
-def _px_width(excel_width: float) -> int:
-    return max(10, int(excel_width * 7 + 6))
+
+def hf_friendly_name(coord: str) -> str:
+    """'HF:oddFooter.R' -> 'Fußzeile · rechts'"""
+    try:
+        part, section = coord[len(HF_PREFIX):].rsplit(".", 1)
+        return f"{HF_PART_NAMES.get(part, part)} · {HF_SECTION_NAMES.get(section, section)}"
+    except ValueError:
+        return coord
 
 
-def _px_height(points: float) -> int:
-    return max(14, int(points * 96 / 72))
+def _px_width(excel_width: float, scale: float) -> int:
+    return max(8, int((excel_width * 7 + 6) * scale))
+
+
+def _px_height(points: float, scale: float) -> int:
+    return max(10, int(points * 96 / 72 * scale))
 
 
 def _excel_color(color_obj, fallback: str) -> str:
@@ -51,10 +73,11 @@ def _excel_color(color_obj, fallback: str) -> str:
 
 
 class CellWidget:
-    """Ein klickbares Feld im Tabellenraster."""
+    """Ein klickbares Feld im Seitenraster (Zelle oder Kopf-/Fußzeilen-Teil)."""
 
     def __init__(self, sheet: "SheetView", coord: str, row: int, col: int,
-                 text: str, w_px: int, h_px: int, rowspan: int, colspan: int,
+                 grid_row: int, text: str, w_px: int, h_px: int,
+                 rowspan: int, colspan: int,
                  font: tkfont.Font, bg: str, fg: str, anchor: str,
                  justify: str, wrap: bool):
         self.sheet = sheet
@@ -79,11 +102,15 @@ class CellWidget:
             wraplength=max(10, w_px - 8) if wrap else 0)
         self.label.pack(fill="both", expand=True)
 
-        self.frame.grid(row=row, column=col, rowspan=rowspan,
+        self.frame.grid(row=grid_row, column=col, rowspan=rowspan,
                         columnspan=colspan, sticky="nsew")
         for w in (self.frame, self.label):
             w.bind("<Button-1>", lambda _e, c=coord: sheet.select(c))
-        sheet.register_tooltip(self.label, f"{coord}: {text or '(leer)'}")
+        tip = f"{coord}: {text or '(leer)'}"
+        if coord.startswith(HF_PREFIX):
+            tip = f"{hf_friendly_name(coord)}: {text}\n" \
+                  "(&P = Seitenzahl, &N = Seiten gesamt, &G = Grafik)"
+        sheet.register_tooltip(self.label, tip)
 
     # -- Zustand ------------------------------------------------------
 
@@ -109,13 +136,15 @@ class CellWidget:
 
 
 class SheetView(ttk.Frame):
-    """Scrollbare, klickbare Vorlagen-Ansicht mit fixierten Kopfleisten."""
+    """Scrollbare, klickbare Seitenansicht mit fixierten Kopfleisten."""
 
     def __init__(self, master, on_select: Callable[[Optional[str]], None]):
         super().__init__(master)
         self.on_select = on_select
         self.cells: dict[str, CellWidget] = {}
+        self.anchors: dict[str, tuple[str, str]] = {}
         self.selected: Optional[str] = None
+        self.scale = 1.0
         self._fonts: dict[tuple, tkfont.Font] = {}
         self._matches: list[str] = []
         self._match_idx = -1
@@ -151,12 +180,9 @@ class SheetView(ttk.Frame):
         self.grid_frame = tk.Frame(self.canvas, background="white")
         self.top_frame = tk.Frame(self.top_canvas, background=HEADER_BG)
         self.left_frame = tk.Frame(self.left_canvas, background=HEADER_BG)
-        self._grid_win = self.canvas.create_window((0, 0), window=self.grid_frame,
-                                                   anchor="nw")
-        self._top_win = self.top_canvas.create_window((0, 0), window=self.top_frame,
-                                                      anchor="nw")
-        self._left_win = self.left_canvas.create_window((0, 0), window=self.left_frame,
-                                                        anchor="nw")
+        self.canvas.create_window((0, 0), window=self.grid_frame, anchor="nw")
+        self.top_canvas.create_window((0, 0), window=self.top_frame, anchor="nw")
+        self.left_canvas.create_window((0, 0), window=self.left_frame, anchor="nw")
         self.grid_frame.bind("<Configure>", lambda _e: self._update_scrollregions())
         self.top_frame.bind("<Configure>", lambda _e: self._update_scrollregions())
         self.left_frame.bind("<Configure>", lambda _e: self._update_scrollregions())
@@ -174,120 +200,233 @@ class SheetView(ttk.Frame):
         from .gui import ToolTip  # zirkulären Import vermeiden
         self._tooltips.append(ToolTip(widget, text))
 
-    def _font(self, bold: bool, size: float) -> tkfont.Font:
-        key = (bold, round(size, 1))
+    def _font(self, bold: bool, size: float, italic: bool = False) -> tkfont.Font:
+        key = (bold, round(size * self.scale, 1), italic)
         if key not in self._fonts:
             self._fonts[key] = tkfont.Font(
-                family="Segoe UI", size=int(round(size)),
-                weight="bold" if bold else "normal")
+                family="Segoe UI", size=max(6, int(round(size * self.scale))),
+                weight="bold" if bold else "normal",
+                slant="italic" if italic else "roman")
         return self._fonts[key]
 
-    def load_template(self, path: str, keep: Optional[dict] = None):
-        """Lädt eine Vorlage und baut das Raster komplett neu auf."""
+    def load_template(self, path: str, keep: Optional[dict] = None,
+                      scale: Optional[float] = None):
+        """Lädt eine Vorlage und baut die komplette Seite neu auf."""
+        if scale is not None:
+            self.scale = scale
         for cell in self.cells.values():
             cell.frame.destroy()
         for w in self.top_frame.winfo_children() + self.left_frame.winfo_children():
             w.destroy()
+        for w in self.grid_frame.winfo_children():
+            w.destroy()
         self.cells.clear()
+        self.anchors.clear()
         self._tooltips.clear()
         self.selected = None
         self._matches = []
         keep = keep or {}
+        sc = self.scale
 
         wb = openpyxl.load_workbook(path, data_only=True)
         try:
             ws = wb.worksheets[0]
             max_row, max_col = ws.max_row, ws.max_column
 
-            # Spaltenbreiten / Zeilenhöhen in Pixeln
             col_px = [ROW_HEADER_W]
             for c in range(1, max_col + 1):
                 dim = ws.column_dimensions.get(idx_to_col(c))
                 width = dim.width if (dim and dim.width) else DEFAULT_COL_WIDTH
-                col_px.append(_px_width(width))
+                col_px.append(_px_width(width, sc))
             row_px = [COL_HEADER_H]
             for r in range(1, max_row + 1):
                 dim = ws.row_dimensions.get(r)
                 height = dim.height if (dim and dim.height) else DEFAULT_ROW_HEIGHT
-                row_px.append(_px_height(height))
+                row_px.append(_px_height(height, sc))
+
+            # Kopf-/Fußzeile (wie im Ausdruck)
+            hf_defs = (
+                ("top", "oddHeader", ws.oddHeader),
+                ("top", "firstHeader", ws.firstHeader),
+                ("top", "evenHeader", ws.evenHeader),
+                ("bottom", "oddFooter", ws.oddFooter),
+                ("bottom", "firstFooter", ws.firstFooter),
+                ("bottom", "evenFooter", ws.evenFooter),
+            )
+            top_parts: list[tuple[str, str]] = []
+            bottom_parts: list[tuple[str, str]] = []
+            for where, part, obj in hf_defs:
+                for section, item in (("L", obj.left), ("C", obj.center),
+                                      ("R", obj.right)):
+                    if item.text:
+                        entry = (f"{HF_PREFIX}{part}.{section}",
+                                 hf_display_text(item.text).strip("\n"))
+                        (top_parts if where == "top" else bottom_parts).append(entry)
+
+            # Seitenumbrüche (gestrichelte Linien) - nicht mitten durch Verbund
+            breaks = set()
+            if ws.row_breaks and ws.row_breaks.brk:
+                breaks = {int(b.id) for b in ws.row_breaks.brk if b.id}
+            for rng in ws.merged_cells.ranges:
+                for br in list(breaks):
+                    if rng.min_row <= br < rng.max_row:
+                        breaks.discard(br)
+
+            # Seiten-Plan: Kopfzeile(n), Datenzeilen + Umbrüche, Fußzeile(n)
+            plan: list[tuple[str, object]] = []
+            if top_parts:
+                plan.append(("hf_top", top_parts))
+            for r in range(1, max_row + 1):
+                plan.append(("row", r))
+                if r in breaks:
+                    plan.append(("sep", r))
+            if bottom_parts:
+                plan.append(("hf_bottom", bottom_parts))
+
+            grid_row_of: dict[int, int] = {}
+            for idx, (kind, payload) in enumerate(plan):
+                if kind == "row":
+                    grid_row_of[payload] = idx
+
+            # Kopfleiste (Spaltenbuchstaben)
+            for c in range(1, max_col + 1):
+                tk.Label(self.top_frame, text=idx_to_col(c), background=HEADER_BG,
+                         foreground="#4A5568", font=self._font(True, 9),
+                         relief="solid", borderwidth=1,
+                         ).grid(row=0, column=c, sticky="nsew", ipady=2)
+                self.top_frame.grid_columnconfigure(c, minsize=col_px[c])
+            for c in range(1, max_col + 1):
+                self.grid_frame.grid_columnconfigure(c, minsize=col_px[c])
+
+            hf_font = self._font(False, 8.5, italic=True)
+
+            def hf_row_height(parts):
+                lines = max((txt.count("\n") + 1 for _c, txt in parts), default=1)
+                return int((lines * 13 + 10) * sc) + 6
+
+            # Zeilen nach Plan aufbauen
+            for idx, (kind, payload) in enumerate(plan):
+                if kind == "row":
+                    r = payload
+                    self.grid_frame.grid_rowconfigure(idx, minsize=row_px[r])
+                    tk.Label(self.left_frame, text=str(r), background=HEADER_BG,
+                             foreground="#4A5568", font=self._font(True, 9),
+                             relief="solid", borderwidth=1,
+                             ).grid(row=idx, column=0, sticky="nsew")
+                    self.left_frame.grid_rowconfigure(idx, minsize=row_px[r] + 1)
+
+                elif kind == "sep":
+                    self.grid_frame.grid_rowconfigure(idx, minsize=8)
+                    sep = tk.Canvas(self.grid_frame, height=8, highlightthickness=0,
+                                    background="white")
+                    sep.grid(row=idx, column=1, columnspan=max_col, sticky="ew")
+                    sep.bind("<Configure>", lambda e, cv=sep: self._draw_sep(cv))
+                    tk.Label(self.left_frame, text="", background=HEADER_BG,
+                             ).grid(row=idx, column=0, sticky="nsew")
+                    self.left_frame.grid_rowconfigure(idx, minsize=8)
+
+                elif kind in ("hf_top", "hf_bottom"):
+                    parts = payload
+                    h_px = hf_row_height(parts)
+                    self.grid_frame.grid_rowconfigure(idx, minsize=h_px)
+                    third = max(1, max_col // 3)
+                    spans = ((1, third), (third + 1, 2 * third),
+                             (2 * third + 1, max_col))
+                    for (coord, text), (c1, c2) in zip(parts, spans):
+                        section = coord.rsplit(".", 1)[1]
+                        anchor = {"L": "w", "C": "center", "R": "e"}[section]
+                        justify = {"L": "left", "C": "center", "R": "right"}[section]
+                        w_px = sum(col_px[c1:c2 + 1]) + (c2 - c1)
+                        widget = CellWidget(
+                            self, coord, -1, c1, idx, text, w_px, h_px,
+                            1, c2 - c1 + 1, hf_font, HF_BG, "#333333",
+                            anchor, justify, True)
+                        self.cells[coord] = widget
+                    label = "Kopf" if kind == "hf_top" else "Fuß"
+                    tk.Label(self.left_frame, text=label, background=HEADER_BG,
+                             foreground="#98A2B3", font=self._font(False, 7),
+                             ).grid(row=idx, column=0, sticky="nsew")
+                    self.left_frame.grid_rowconfigure(idx, minsize=h_px)
 
             # Verbundene Zellen
             span: dict[str, tuple[int, int]] = {}
             covered: set[str] = set()
             for rng in ws.merged_cells.ranges:
                 anchor = f"{idx_to_col(rng.min_col)}{rng.min_row}"
-                span[anchor] = (rng.max_row - rng.min_row + 1,
-                                rng.max_col - rng.min_col + 1)
+                span[anchor] = (rng.min_row, rng.max_row, rng.min_col, rng.max_col)
                 for r in range(rng.min_row, rng.max_row + 1):
                     for c in range(rng.min_col, rng.max_col + 1):
                         if (r, c) != (rng.min_row, rng.min_col):
                             covered.add(f"{idx_to_col(c)}{r}")
 
-            # Kopfleisten
-            for c in range(1, max_col + 1):
-                tk.Label(self.top_frame, text=idx_to_col(c), background=HEADER_BG,
-                         foreground="#4A5568", font=self._font(True, 9),
-                         width=col_px[c] // 7, relief="solid", borderwidth=1,
-                         ).grid(row=0, column=c, sticky="nsew",
-                                ipady=2)
-                self.top_frame.grid_columnconfigure(c, minsize=col_px[c])
-            for r in range(1, max_row + 1):
-                tk.Label(self.left_frame, text=str(r), background=HEADER_BG,
-                         foreground="#4A5568", font=self._font(True, 9),
-                         relief="solid", borderwidth=1,
-                         ).grid(row=r, column=0, sticky="nsew")
-                self.left_frame.grid_rowconfigure(r, minsize=row_px[r] + 1)
-
-            # Raster-Konfiguration (Mindestgrößen)
-            for c in range(1, max_col + 1):
-                self.grid_frame.grid_columnconfigure(c, minsize=col_px[c])
-            for r in range(1, max_row + 1):
-                self.grid_frame.grid_rowconfigure(r, minsize=row_px[r])
-
-            # Zellen
+            # Daten-Zellen
             for r in range(1, max_row + 1):
                 for c in range(1, max_col + 1):
                     coord = f"{idx_to_col(c)}{r}"
                     if coord in covered:
                         continue
                     cell = ws.cell(row=r, column=c)
-                    rs, cs = span.get(coord, (1, 1))
-                    w_px = sum(col_px[c:c + cs]) + (cs - 1)
-                    h_px = sum(row_px[r:r + rs]) + (rs - 1)
+                    r1, r2, c1, c2 = span.get(coord, (r, r, c, c))
+                    rs = grid_row_of[r2] - grid_row_of[r1] + 1
+                    cs = c2 - c1 + 1
+                    w_px = sum(col_px[c1:c2 + 1]) + (cs - 1)
+                    h_px = sum(row_px[r1:r2 + 1]) + (rs - 1)
 
-                    value = cell.value
-                    text = self._format_value(value)
-
+                    text = self._format_value(cell.value)
                     bold = bool(cell.font and cell.font.b)
                     size = float(cell.font.sz) if (cell.font and cell.font.sz) else 11.0
                     fg = _excel_color(cell.font.color if cell.font else None, "#1a1a1a")
                     fill = cell.fill
                     bg = _excel_color(fill.fgColor, "#FFFFFF") \
                         if (fill and fill.patternType) else "#FFFFFF"
-
                     align = cell.alignment
                     horizontal = align.horizontal if align else None
                     anchor = {"left": "w", "center": "center",
                               "right": "e"}.get(horizontal, "w")
                     justify = {"left": "left", "center": "center",
                                "right": "right"}.get(horizontal, "left")
-                    if align and align.vertical == "center":
-                        anchor = {"w": "w", "center": "center", "e": "e"}[anchor]
                     wrap = bool(align and align.wrap_text)
 
-                    widget = CellWidget(self, coord, r, c, text, w_px, h_px,
-                                        rs, cs, self._font(bold, min(size, 16)),
-                                        bg, fg, anchor, justify, wrap)
+                    widget = CellWidget(
+                        self, coord, r, c, grid_row_of[r], text, w_px, h_px,
+                        rs, cs, self._font(bold, min(size, 16)),
+                        bg, fg, anchor, justify, wrap)
                     self.cells[coord] = widget
-
                     if coord in keep:
                         widget.set_new_text(keep[coord])
 
+            self._compute_anchors()
             self.grid_frame.update_idletasks()
             self._update_scrollregions()
             return len(self.cells)
         finally:
             wb.close()
+
+    def _draw_sep(self, canvas: tk.Canvas):
+        canvas.delete("all")
+        canvas.create_line(2, 4, canvas.winfo_width(), 4,
+                           fill="#7A86A0", dash=(6, 4))
+
+    def _compute_anchors(self):
+        """Fuer jede Zelle die naechste Beschriftung (links, sonst oberhalb)."""
+        texts = {c: w.orig_text for c, w in self.cells.items()
+                 if not c.startswith(HF_PREFIX) and w.orig_text}
+        for coord, w in self.cells.items():
+            if coord.startswith(HF_PREFIX):
+                continue
+            anchor = ("", "")
+            for cc in range(w.col - 1, 0, -1):
+                t = texts.get(f"{idx_to_col(cc)}{w.row}")
+                if t:
+                    anchor = (t, f"{idx_to_col(cc)}{w.row}")
+                    break
+            if not anchor[0]:
+                for rr in range(w.row - 1, 0, -1):
+                    t = texts.get(f"{idx_to_col(w.col)}{rr}")
+                    if t:
+                        anchor = (t, f"{idx_to_col(w.col)}{rr}")
+                        break
+            self.anchors[coord] = anchor
 
     @staticmethod
     def _format_value(value) -> str:
@@ -322,6 +461,9 @@ class SheetView(ttk.Frame):
         cell = self.cells.get(coord)
         return cell.orig_text if cell else ""
 
+    def anchor_of(self, coord: str) -> tuple[str, str]:
+        return self.anchors.get(coord, ("", ""))
+
     def changed(self) -> dict[str, str]:
         """Alle geänderten Felder: Koordinate -> neuer Wert ('' = leeren)."""
         return {c: w.new_text for c, w in self.cells.items()
@@ -347,7 +489,7 @@ class SheetView(ttk.Frame):
     def next_match(self) -> Optional[str]:
         if not self._matches:
             return None
-        if self._match_idx >= 0 and self._match_idx < len(self._matches):
+        if 0 <= self._match_idx < len(self._matches):
             self.cells[self._matches[self._match_idx]].flash_match(False)
         self._match_idx = (self._match_idx + 1) % len(self._matches)
         coord = self._matches[self._match_idx]

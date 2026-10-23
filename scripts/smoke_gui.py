@@ -1,7 +1,8 @@
 """Headless-Smoke-Test der GUI (unter xvfb-run ausfuehren).
 
-Baut die komplette Oberflaeche auf, simuliert das Ausfuellen eines Feldes,
-das Hereinziehen zweier Dateien (Batch) und prueft das Ergebnis.
+Baut die komplette Oberflaeche auf, simuliert das Anklicken eines Feldes in
+der Vorlagen-Ansicht, das Eintragen von Aenderungen, das Hereinziehen zweier
+Dateien (Batch) und prueft das Ergebnis.
 """
 
 import os
@@ -29,19 +30,22 @@ def pump(app, seconds):
 
 def main():
     app = SpeziSmithApp()
-    pump(app, 0.5)
+    pump(app, 1.0)
 
-    # 1) Felder wurden aus der Vorlage geladen
-    assert len(app.rows) > 80, f"zu wenige Felder: {len(app.rows)}"
-    print(f"OK: {len(app.rows)} Felder geladen (DE)")
+    # 1) Vorlagen-Ansicht wurde aufgebaut
+    assert len(app.sheet.cells) > 100, f"zu wenige Zellen: {len(app.sheet.cells)}"
+    print(f"OK: {len(app.sheet.cells)} klickbare Zellen im Raster (DE)")
 
-    # 2) Feld A1 aktivieren und Wert eintragen (Auto-Haken via Entry)
-    row = next(r for r in app.rows if r.field.coord == "A1")
-    row.new_value.set("SmokeTest GmbH")
-    assert row.checked.get(), "Auto-Haken wurde nicht gesetzt"
+    # 2) Feld A1 anklicken und Wert eintragen (wie der Anwender)
+    app.sheet.select("A1")
+    assert app.sel_coord_var.get() == "A1"
+    app.sel_new_var.set("SmokeTest GmbH")
+    pump(app, 0.2)
+    assert app.sheet.cells["A1"].new_text == "SmokeTest GmbH"
+    assert app.sheet.cells["A1"].changed
     rules = app._collect_rules()
     assert len(rules) == 1 and rules[0].new == "SmokeTest GmbH"
-    print("OK: Regel erzeugt:", rules[0])
+    print("OK: Regel aus Klick+Tippen erzeugt:", rules[0].coord)
 
     # 3) Zwei Dateien vorbereiten und "hereinziehen"
     tmp = tempfile.mkdtemp(prefix="spezismith_smoke_")
@@ -77,26 +81,34 @@ def main():
     assert len(log_items) == 2, f"Log-Eintraege: {len(log_items)}"
     print("OK: Log enthaelt beide Dateien")
 
-    # 5) Sprachwechsel auf Englisch (Eingaben bleiben fuer gleiche Zellen erhalten)
+    # 5) Sprachwechsel auf Englisch (Aenderung auf A1 bleibt erhalten)
     app.lang_var.set("English")
     app._on_language_change()
-    pump(app, 0.3)
-    row_a1 = next(r for r in app.rows if r.field.coord == "A1")
-    assert row_a1.new_value.get() == "SmokeTest GmbH"
-    assert any(r.field.coord == "A3" and "Product" in r.field.value
-               for r in app.rows)
-    print(f"OK: Sprachwechsel nach EN, {len(app.rows)} Felder, Eingabe erhalten")
+    pump(app, 1.0)
+    assert app.sheet.cells["A1"].new_text == "SmokeTest GmbH"
+    assert app.sheet.cells["A1"].changed
+    assert "Product" in app.sheet.cells["A3"].orig_text
+    print(f"OK: Sprachwechsel nach EN ({len(app.sheet.cells)} Zellen), "
+          f"Aenderung auf A1 erhalten")
 
-    # 6) Filter (Teilstring-Suche: "A13" trifft nur Zeilen, die A13 enthalten)
-    app.filter_var.set("A13")
-    app._apply_filter()
-    visible = [r for r in app.rows if r.l_coord.winfo_manager()]
-    assert visible and all("a13" in (r.field.coord + r.field.label
-                                     + r.field.value).lower()
-                           for r in visible), [r.field.coord for r in visible]
-    assert any(r.field.coord == "A13" for r in visible)
-    app.filter_var.set("")
-    print("OK: Filter funktioniert")
+    # 6) Suche
+    app.search_var.set("Article")
+    app._search_next()
+    info = app.search_info_var.get()
+    assert "Treffer 1/" in info, info
+    first = app.sheet.selected
+    app._search_next()
+    assert app.sheet.selected != first or len(app.sheet._matches) == 1
+    print("OK: Suche funktioniert:", info)
+
+    # 7) Feld leeren + Zuruecknehmen
+    app.sheet.select("B71")
+    app.sel_clear_var.set(True)
+    app._on_clear_toggled()
+    assert app.sheet.cells["B71"].new_text == ""
+    app._revert_current()
+    assert app.sheet.cells["B71"].new_text is None
+    print("OK: Feld leeren / Zuruecknehmen funktioniert")
 
     print("\nSMOKE-TEST ERFOLGREICH")
     app.root.destroy()

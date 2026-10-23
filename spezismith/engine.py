@@ -247,16 +247,80 @@ def analyze_template(path: str, include_empty_inputs: bool = True) -> list[Field
 # ZIP/XML-Surgery (format- und bild-sicheres Ersetzen)
 # ---------------------------------------------------------------------------
 
+_ROOT_START_RE = re.compile(r"<((?:[A-Za-z0-9_]+:)?[A-Za-z0-9_]+)((?:\s+[^<>]*)?)>")
+_XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+
+
+def _root_start_tag(xml_text: str) -> str:
+    """Liefert den kompletten Start-Tag des Wurzelelements (hinter <?xml ... ?>)."""
+    body = xml_text.split("?>", 1)[1] if "?>" in xml_text else xml_text
+    m = _ROOT_START_RE.search(body)
+    return m.group(0) if m else ""
+
+
 def _register_namespaces(xml_text: str) -> list[tuple[str, str]]:
     """Registriert alle im Root deklarierten Namespaces bei ElementTree."""
-    root_tag = xml_text[: xml_text.find(">") + 1]
-    decls = re.findall(r'xmlns(?::([A-Za-z0-9_]+))?="([^"]+)"', root_tag)
+    decls = re.findall(r'xmlns(?::([A-Za-z0-9_.]+))?="([^"]+)"', _root_start_tag(xml_text))
     for prefix, uri in decls:
         try:
             ET.register_namespace(prefix, uri)
         except ValueError:
             pass
     return decls
+
+
+def _restore_namespaces(xml_text: str, decls: list[tuple[str, str]]) -> str:
+    """
+    Stellt sicher, dass alle urspruenglichen Namespace-Deklarationen im Root
+    vorhanden sind - insbesondere alle Praefixe aus mc:Ignorable, denn Excel
+    meldet sonst einen XML-Fehler und startet die 'Reparatur'.
+    """
+    root_tag = _root_start_tag(xml_text)
+    if not root_tag:
+        raise ValueError("Wurzelelement im serialisierten XML nicht gefunden.")
+
+    known = dict(decls)
+    missing: list[tuple[str, str]] = []
+    for prefix, uri in decls:
+        marker = f'xmlns:{prefix}=' if prefix else "xmlns="
+        if marker not in root_tag:
+            missing.append((prefix, uri))
+
+    new_root = root_tag
+    if missing:
+        inject = "".join(
+            f' xmlns:{p}="{u}"' if p else f' xmlns="{u}"' for p, u in missing
+        )
+        new_root = root_tag[:-1] + inject + ">"
+
+    # Praefixe in mc:Ignorable ohne bekannte URI herausloesen
+    ign = re.search(r'(?:\w+:)?Ignorable="([^"]+)"', new_root)
+    if ign:
+        keep = []
+        for prefix in ign.group(1).split():
+            if prefix in known or f'xmlns:{prefix}=' in new_root:
+                keep.append(prefix)
+        if keep != ign.group(1).split():
+            new_root = new_root.replace(
+                ign.group(0),
+                ign.group(0).replace(f'"{ign.group(1)}"', f'"{" ".join(keep)}"'),
+            )
+
+    return xml_text.replace(root_tag, new_root, 1)
+
+
+def _validate_sheet_xml(xml_text: str) -> None:
+    """Strikte Validierung, damit Excel die Datei nicht 'reparieren' muss."""
+    ET.fromstring(xml_text.encode("utf-8"))  # Wohlgeformtheit
+    root_tag = _root_start_tag(xml_text)
+    attrs = re.findall(r'(xmlns(?::[A-Za-z0-9_.]+)?)="', root_tag)
+    if len(attrs) != len(set(attrs)):
+        raise ValueError("Doppelte xmlns-Attribute im Wurzelelement.")
+    ign = re.search(r'(?:\w+:)?Ignorable="([^"]+)"', root_tag)
+    if ign:
+        for prefix in ign.group(1).split():
+            if f'xmlns:{prefix}=' not in root_tag:
+                raise ValueError(f"mc:Ignorable-Praefix '{prefix}' nicht deklariert.")
 
 
 def _read_shared_strings(zf: zipfile.ZipFile) -> list[str]:
@@ -456,22 +520,9 @@ def apply_to_file(
                     status="geaendert",
                 ))
 
-            new_xml = ET.tostring(root, encoding="unicode", xml_declaration=True)
-            # URIs aus der urspruenglichen Root-Deklaration sicherstellen
-            root_tag_open = new_xml[: new_xml.find(">") + 1]
-            missing = [
-                (p, u) for p, u in ns_decls
-                if (f'xmlns:{p}=' if p else "xmlns=") not in root_tag_open
-            ]
-            if missing:
-                inject = "".join(
-                    f' xmlns:{p}="{u}"' if p else f' xmlns="{u}"' for p, u in missing
-                )
-                new_xml = new_xml.replace(
-                    "<worksheet ", f"<worksheet{inject} ", 1
-                ) if "<worksheet " in new_xml else new_xml.replace(
-                    "<worksheet>", f"<worksheet{inject}>", 1
-                )
+            new_xml = _XML_DECL + ET.tostring(root, encoding="unicode")
+            new_xml = _restore_namespaces(new_xml, ns_decls)
+            _validate_sheet_xml(new_xml)
 
             os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
             tmp_target = target + ".tmp"

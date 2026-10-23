@@ -62,6 +62,51 @@ def test_analyze_en_fields():
 # Ersetzen (ZIP-Surgery)
 # ---------------------------------------------------------------------------
 
+def _sheet_xml(path):
+    import re as _re
+    import xml.dom.minidom as _md
+    with zipfile.ZipFile(path) as z:
+        xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    # strikte Wohlgeformtheit (expat bricht bei doppelten Attributen ab)
+    _md.parseString(xml.encode("utf-8"))
+    body = xml.split("?>", 1)[1]
+    root_tag = _re.search(r"<((?:\w+:)?\w+)((?:\s+[^<>]*)?)>", body).group(0)
+    # mc:Ignorable-Praefixe muessen deklariert sein (sonst Excel-Reparatur!)
+    ign = _re.search(r'(?:\w+:)?Ignorable="([^"]+)"', root_tag)
+    if ign:
+        for prefix in ign.group(1).split():
+            assert f'xmlns:{prefix}=' in root_tag, \
+                f"Praefix '{prefix}' in Ignorable nicht deklariert"
+    return xml, root_tag
+
+
+def test_output_is_excel_valid(tmp_path):
+    """Beide Vorlagen muessen nach der Bearbeitung Excel-konformes XML haben."""
+    for tpl in (TPL_DE, TPL_EN):
+        out = tmp_path / (os.path.basename(tpl))
+        res = apply_to_file(tpl, str(out), [
+            Rule(coord="A1", new="Neue Firma GmbH"),
+            Rule(coord="J1", new="01.01.2027", mode="replace", find="xx.xx.xxxx"),
+        ])
+        assert res.ok, res.error
+        xml, root_tag = _sheet_xml(str(out))
+        # urspruengliche Namespace-Praefixe bleiben erhalten (kein ns0/ns1...)
+        assert "ns0" not in root_tag and "ns1:" not in root_tag
+
+
+def test_merged_target_written_to_anchor(tmp_path):
+    """A1 ist Anker eines Verbundes - Schreiben darf den Verbund nicht zerstoeren."""
+    out = tmp_path / "out.xlsx"
+    res = apply_to_file(TPL_DE, str(out), [Rule(coord="B1", new="X")])
+    assert res.ok, res.error
+    assert res.cells[0].coord == "A1"  # auf Anker gemappt
+    wb = openpyxl.load_workbook(out)
+    try:
+        assert "X" in str(wb.worksheets[0]["A1"].value)
+    finally:
+        wb.close()
+
+
 def _read_cell(path, coord):
     wb = openpyxl.load_workbook(path, data_only=True)
     try:

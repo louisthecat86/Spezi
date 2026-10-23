@@ -8,15 +8,14 @@ anpassen** – als portable Windows-EXE, die ohne Installation überall läuft
 
 ## Was macht das Tool?
 
-1. **Felder analysieren:** SpeziSmith liest die hinterlegte Vorlage (Deutsch *oder*
-   Englisch – wählbar oben rechts) und listet **jedes einzelne Feld** der
-   Spezifikation auf: befüllte Zellen *und* leere Eingabefelder neben
-   Beschriftungen.
-2. **Auswählen & neuen Wert eintragen:** Haken setzen (entsteht automatisch, sobald
-   man tippt) und in das Kästchen dahinter den neuen Wert schreiben.
-   Beispiel: Feld `A1` enthält „Test“ → Haken an `A1`, „Test1“ eintragen.
-3. **Spezis hereinziehen:** Eine oder **mehrere Spezifikationen gleichzeitig**
-   (z. B. 5 markierte Dateien) in die Drag-&-Drop-Zone ziehen. Alle aktivierten
+1. **Vorlage sehen wie das Original:** SpeziSmith zeigt die Spezifikation
+   **maßstabsgetreu wie in Excel** an (Deutsch *oder* Englisch – wählbar oben
+   rechts): Spaltenbreiten, Zeilenhöhen, verbundene Zellen, Schrift- und
+   Füllfarben inklusive. Man klickt **einfach genau das Feld an**, das man
+   ändern will, und trägt unten den neuen Wert ein – die Änderung wird sofort
+   farblich hervorgehoben direkt im Layout sichtbar (WYSIWYG).
+2. **Spezis hereinziehen:** Eine oder **mehrere Spezifikationen gleichzeitig**
+   (z. B. 5 markierte Dateien) in die Drag-&-Drop-Zone ziehen. Alle geänderten
    Felder werden ersetzt; das Ergebnis landet wahlweise
    - in einem **Zielordner** (Pfad eingeben/durchsuchen) oder
    - per **„Speichern unter“-Dialog** („Download“-Gefühl) für jede Datei.
@@ -29,8 +28,10 @@ XML-Ebene, kein verlustbehafteter Excel-Roundtrip).
 
 - 🌍 **Sprachauswahl** Deutsch/English; abgelegte Dateien mit der „falschen“
   Sprache werden erkannt und übersprungen (Warnung im Log)
-- 🔎 **Filter** über Zelle, Beschriftung und aktuellen Wert
-- ☑️ Zählwerk „x von y Feldern aktiv“, „Alle/Keine“, „Nur aktive anzeigen“
+- 🔎 **Suche** über Zelle und Inhalt, springt per Enter durch alle Treffer
+- ✏️ Änderungen direkt in der Vorlagen-Ansicht sichtbar; pro Feld auch
+  **„Feld leeren“** oder **„Zurücknehmen“** möglich
+- ☑️ Zählwerk „x Felder geändert“ und „Alle Änderungen verwerfen“
 - ✍️ Zwei Ersetzungsmodi: **ganze Zelle** oder **Teiltext** (z. B. Datum im Kopf)
 - 🛡️ Optionale Verifikation: nur ersetzen, wenn der Ist-Wert dem Vorlagenwert
   entspricht (Abweichungen werden übersprungen und gemeldet)
@@ -63,7 +64,7 @@ kopieren kann.
 
 | Schritt | Aktion |
 |---|---|
-| 1 | Sprache wählen → Felder filtern → Haken setzen + neue Werte eintragen |
+| 1 | Sprache wählen → **Feld in der Vorlage anklicken** → neuen Wert eintragen (Suche hilft beim Finden) |
 | 2 | Zielordner angeben *oder* „Nach jeder Datei fragen“; Dateinamen-Zusatz (Standard `_angepasst`); optional Verifikation/Teiltext-Modus |
 | 3 | `.xlsx`-Dateien in die Drop-Zone ziehen (Mehrfachauswahl!) oder über die Schaltfläche auswählen |
 
@@ -86,6 +87,7 @@ python scripts/make_assets.py     # Logo/Icon neu erzeugen
 ├── main.py                  # Einstieg / PyInstaller-Ziel
 ├── spezismith/
 │   ├── engine.py            # Analyse, Spracherkennung, XML-sicheres Ersetzen
+│   ├── sheetview.py         # klickbare WYSIWYG-Vorlagenansicht
 │   ├── gui.py               # Oberfläche (ttk + Sun-Valley + DnD)
 │   └── resources.py         # Pfade, portable Konfiguration
 ├── templates/               # eingebettete Vorlagen (DE/EN)

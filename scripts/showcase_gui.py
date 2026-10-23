@@ -16,19 +16,26 @@ if os.path.exists(CFG):
 
 def main():
     app = SpeziSmithApp()
-    app.root.geometry("1120x780+30+30")
+    app.root.geometry("1240x800+20+20")
 
-    # Beispiel-Eintraege
-    demo = {"A5": "123456", "A6": "Ofenkäse Schnitte 2,5 kg", "A7": "2500",
-            "A1": "Musterfirma GmbH, Musterstraße 1, 12345 Musterstadt"}
-    for row in app.rows:
-        if row.field.coord in demo:
-            row.new_value.set(demo[row.field.coord])
+    # warten, bis die Vorlagen-Ansicht aufgebaut ist
+    end = time.time() + 4.0
+    while time.time() < end and not app.sheet.cells:
+        app.root.update()
+        time.sleep(0.05)
 
+    # Beispiel-Aenderungen, als haette der Anwender sie eingetippt
+    demo = {"A5": "123456", "A6": "Ofenkäse-Schnitte 2,5 kg", "A7": "2500",
+            "J1": "Spezifikation gültig ab 01.01.2027"}
+    for coord, text in demo.items():
+        if coord in app.sheet.cells:
+            app.sheet.set_new_value(coord, text)
+    app.sheet.select("A6")
+    app.sel_new_var.set("Ofenkäse-Schnitte 2,5 kg")
+    app._refresh_counter()
     app.out_dir.set(os.path.join(ROOT, "Ausgabe"))
-    app.refresh_counter()
 
-    end = time.time() + 3.5
+    end = time.time() + 3.0
     while time.time() < end:
         app.root.update()
         time.sleep(0.05)

@@ -425,3 +425,21 @@ def test_missing_field_without_position_is_skipped(tmp_path):
     assert res.cells[0].status == "uebersprungen"
     ws = openpyxl.load_workbook(out).active
     assert ws["B2"].value == "4711"
+
+
+def test_multiline_cell_with_other_date_and_initials(tmp_path):
+    spec = tmp_path / "spec.xlsx"
+    _mini_spec(spec, [("Titel", None),
+                      ("Spezifikation gültig ab 01.03.2024\nAB\n", None),
+                      ("Ende", None)])
+    out = tmp_path / "out.xlsx"
+    rule = Rule(coord="A2", new="26.10.2026\nXY", mode="replace",
+                find="Spezifikation gültig ab xx.xx.xxxx\nKürzel",
+                expected="Spezifikation gültig ab xx.xx.xxxx\nKürzel\n",
+                line_start=0, line_count=2,
+                context_above=["Titel"], allow_insert=True)
+    res = apply_to_file(str(spec), str(out), [rule])
+    assert res.ok and res.cells[0].status == "geaendert", res.cells
+    ws = openpyxl.load_workbook(out).active
+    assert ws["A2"].value == "26.10.2026\nXY\n"
+    assert ws["A3"].value == "Ende"

@@ -103,6 +103,8 @@ class Rule:
     anchor_text: str = ""      # Beschriftung neben/ueber dem Feld (Verschiebungs-Anker)
     anchor_coord: str = ""     # Koordinate der Beschriftung in der Vorlage
     context_above: list = field(default_factory=list)  # Texte darueber (nah -> fern)
+    line_start: int = -1       # mehrzeilig: erste geaenderte Zeile (-1 = unbekannt)
+    line_count: int = 0        # mehrzeilig: Anzahl der geaenderten Zeilen
     allow_insert: bool = False  # fehlendes Feld als neue Zeile einfuegen
 
 
@@ -848,20 +850,34 @@ def _find_insert_position(rule: Rule, texts: dict[str, str]) -> Optional[str]:
     return None
 
 
+def _mask(text: str) -> str:
+    """Ziffern und x-Platzhalter egalisieren (Datum 01.02.2025 ~ xx.xx.xxxx)."""
+    return re.sub(r"[0-9xX]", "#", norm_text(text).lower())
+
+
 def _similar_cell(rule: Rule, texts: dict[str, str],
                   anchor_of: dict[str, str]) -> Optional[str]:
     """Aehnlichster Text in derselben Spalte (z. B. 'Revision: 002' zu '003')."""
     if not norm_text(rule.expected):
         return None
     col_s, _ = split_coord(rule.coord)
+    exp = _mask(rule.expected)
+    if sum(ch.isalpha() and ch != "#" for ch in exp) < 3:
+        return None  # reine Zahlen/Kurzwerte sind zu mehrdeutig
+
+    def ratio(t):
+        return difflib.SequenceMatcher(None, _mask(t), exp).ratio()
+
+    own = anchor_of.get(rule.coord, rule.coord)
+    if own in texts and ratio(texts[own]) >= 0.6:
+        return own
     best, best_ratio = None, 0.0
     for c, t in texts.items():
         if split_coord(c)[0] != col_s:
             continue
-        ratio = difflib.SequenceMatcher(
-            None, norm_text(t), norm_text(rule.expected)).ratio()
-        if ratio > best_ratio:
-            best, best_ratio = c, ratio
+        r = ratio(t)
+        if r > best_ratio:
+            best, best_ratio = c, r
     return anchor_of.get(best, best) if best and best_ratio >= 0.75 else None
 
 
@@ -973,7 +989,20 @@ def apply_to_file(
                     ))
                     continue
 
-                if rule.mode == "replace":
+                if rule.mode == "replace" and rule.find not in old \
+                        and rule.line_start >= 0:
+                    # Zeile mit anderem Datum/Kuerzel: ueber die Position ersetzen
+                    lines = old.replace("\r\n", "\n").split("\n")
+                    end = rule.line_start + rule.line_count
+                    if end > len(lines):
+                        result.cells.append(CellResult(
+                            coord=coord, label=rule.label, old=old, new=rule.new,
+                            status="uebersprungen",
+                            message="Zeilenaufbau weicht von der Vorlage ab"))
+                        continue
+                    lines[rule.line_start:end] = rule.new.split("\n")
+                    _set_cell_value(cell, "\n".join(lines))
+                elif rule.mode == "replace":
                     if not rule.find or rule.find not in old:
                         result.cells.append(CellResult(
                             coord=coord, label=rule.label, old=old, new=rule.new,

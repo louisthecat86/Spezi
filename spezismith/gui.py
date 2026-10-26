@@ -71,7 +71,7 @@ def _changed_lines(orig: str, new: str):
     mid_a, mid_b = a[i:len(a) - j], b[i:len(b) - j]
     if not mid_a or not mid_b:
         return None
-    return "\n".join(mid_a), "\n".join(mid_b)
+    return "\n".join(mid_a), "\n".join(mid_b), i, len(mid_a)
 
 
 class VarText(tk.Text):
@@ -736,14 +736,17 @@ class SpeziSmithApp:
             else:
                 label = orig[:40] or coord
             find, repl, rmode = orig, new, mode
+            line_start, line_count = -1, 0
             if not coord.startswith(HF_PREFIX) and new and "\n" in orig:
                 part = _changed_lines(orig, new)
                 if part:
                     find, repl, rmode = part[0], part[1], "replace"
+                    line_start, line_count = part[2], part[3]
             is_hf = coord.startswith(HF_PREFIX)
             rules.append(Rule(
                 coord=coord, new=repl, mode=rmode,
                 find=find, expected=orig,
+                line_start=line_start, line_count=line_count,
                 label=label,
                 anchor_text=anchor_text, anchor_coord=anchor_coord,
                 context_above=([] if is_hf else context_above(

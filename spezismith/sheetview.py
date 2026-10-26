@@ -156,6 +156,7 @@ class SheetView(ttk.Frame):
         self._row_min: dict[int, tuple[int, int]] = {}
         self._path: Optional[str] = None
         self._fit_job = None
+        self._geo: Optional[dict] = None
 
         self.columnconfigure(1, weight=1)
         self.rowconfigure(1, weight=1)
@@ -204,9 +205,12 @@ class SheetView(ttk.Frame):
         self.grid_frame = tk.Frame(self.canvas, background="white")
         self.top_frame = tk.Frame(self.top_canvas, background=HEADER_BG)
         self.left_frame = tk.Frame(self.left_canvas, background=HEADER_BG)
-        self.canvas.create_window((0, 0), window=self.grid_frame, anchor="nw")
-        self.top_canvas.create_window((0, 0), window=self.top_frame, anchor="nw")
-        self.left_canvas.create_window((0, 0), window=self.left_frame, anchor="nw")
+        self._wins = [(self.canvas, self.canvas.create_window(
+            (0, 0), window=self.grid_frame, anchor="nw"))]
+        self._wins.append((self.top_canvas, self.top_canvas.create_window(
+            (0, 0), window=self.top_frame, anchor="nw")))
+        self._wins.append((self.left_canvas, self.left_canvas.create_window(
+            (0, 0), window=self.left_frame, anchor="nw")))
         self.grid_frame.bind("<Configure>", lambda _e: self._update_scrollregions())
         self.top_frame.bind("<Configure>", lambda _e: self._update_scrollregions())
         self.left_frame.bind("<Configure>", lambda _e: self._update_scrollregions())
@@ -244,41 +248,55 @@ class SheetView(ttk.Frame):
             self.scale = scale
         if page is not None:
             self.page = page
-        count = self._build(path, keep)
         if fit:
-            self._autofit(keep)
+            self._build(path, keep, dry=True)
+            self._set_fit_scale()
+        count = self._build(path, keep)
         return count
 
-    def _fit_factor(self) -> Optional[float]:
-        """Faktor, um den der Maßstab geändert werden müsste (1.0 = passt exakt)."""
+    def _sizes_at(self, scale: float) -> tuple[int, int]:
+        """Größe der größten Seite (px) bei gegebenem Maßstab, ohne Aufbau."""
+        geo = self._geo
+        width = sum(_px_width(w, scale) for w in geo["cols"])
+        height = 1
+        for rows in self.pages:
+            h = 0
+            for idx in rows:
+                kind, val = geo["plan"][idx]
+                if kind == "row":
+                    h += _px_height(val, scale)
+                elif kind == "hf":
+                    h += int((val * 13 + 10) * scale) + 6
+            height = max(height, h)
+        return width, height
+
+    def _set_fit_scale(self) -> bool:
+        """Größten Maßstab bestimmen, bei dem die Seite in die Ansicht passt."""
+        if not self._geo:
+            return False
         self.update_idletasks()
         avail_w, avail_h = self.canvas.winfo_width(), self.canvas.winfo_height()
         if avail_w < 100 or avail_h < 100:
-            return None
-        need_w = need_h = 1
-        current = self.page
-        for n in range(len(self.pages)):
-            self._apply_page(n)
-            self.grid_frame.update_idletasks()
-            need_w = max(need_w, self.grid_frame.winfo_reqwidth())
-            need_h = max(need_h, self.grid_frame.winfo_reqheight())
-        self._apply_page(current)
-        return min((avail_w - 4) / need_w, (avail_h - 4) / need_h)
+            return False
+        lo, hi = 0.3, 1.5
+        for _ in range(14):
+            mid = (lo + hi) / 2
+            w, h = self._sizes_at(mid)
+            if w <= avail_w - 4 and h <= avail_h - 4:
+                lo = mid
+            else:
+                hi = mid
+        changed = abs(lo - self.scale) > 0.01
+        self.scale = lo
+        return changed
 
-    def _autofit(self, keep: Optional[dict]):
-        for _ in range(10):
-            factor = self._fit_factor()
-            if factor is None or 1.0 <= factor <= 1.05:
-                break
-            # Feste Mindestgrößen machen die Höhe nicht linear: beim Verkleinern
-            # stärker nachregeln, beim Vergrößern vorsichtig herantasten.
-            step = factor ** 3 * 0.99 if factor < 1.0 else 1.0 + (factor - 1.0) * 0.5
-            new = max(0.3, min(1.5, self.scale * step))
-            if abs(new - self.scale) < 0.005:
-                break
-            self.scale = new
-            self._build(self._path, keep if keep is not None else self.changed())
-        self._apply_page(self.page)
+    def _begin_build(self):
+        for canvas, win in self._wins:
+            canvas.itemconfigure(win, state="hidden")
+
+    def _end_build(self):
+        for canvas, win in self._wins:
+            canvas.itemconfigure(win, state="normal")
 
     def _on_canvas_resize(self, _event=None):
         if not self.fit or not self._path:
@@ -289,30 +307,40 @@ class SheetView(ttk.Frame):
 
     def _refit(self):
         self._fit_job = None
-        factor = self._fit_factor()
-        if factor is not None and not 1.0 <= factor <= 1.05:
+        if self._set_fit_scale():
             keep = self.changed()
             selected = self.selected
-            self._autofit(keep)
+            self._build(self._path, keep)
             if selected in self.cells:
                 self.selected = selected
                 self.cells[selected]._refresh()
 
-    def _build(self, path: str, keep: Optional[dict] = None) -> int:
-        """Baut die komplette Seite neu auf."""
-        for cell in self.cells.values():
+    def _build(self, path: str, keep: Optional[dict] = None,
+               dry: bool = False) -> int:
+        """Baut die komplette Seite neu auf (dry: nur Geometrie ermitteln)."""
+        if not dry:
+            self._begin_build()
+            try:
+                return self._build_impl(path, keep, False)
+            finally:
+                self._end_build()
+        return self._build_impl(path, keep, True)
+
+    def _build_impl(self, path: str, keep: Optional[dict], dry: bool) -> int:
+        for cell in ([] if dry else self.cells.values()):
             cell.frame.destroy()
-        for w in self.top_frame.winfo_children() + self.left_frame.winfo_children():
-            w.destroy()
-        for w in self.grid_frame.winfo_children():
-            w.destroy()
-        self.cells.clear()
-        self._row_items.clear()
-        self._row_min.clear()
-        self.anchors.clear()
-        self._tooltips.clear()
-        self.selected = None
-        self._matches = []
+        if not dry:
+            for w in self.top_frame.winfo_children() + self.left_frame.winfo_children():
+                w.destroy()
+            for w in self.grid_frame.winfo_children():
+                w.destroy()
+            self.cells.clear()
+            self._row_items.clear()
+            self._row_min.clear()
+            self.anchors.clear()
+            self._tooltips.clear()
+            self.selected = None
+            self._matches = []
         keep = keep or {}
         sc = self.scale
 
@@ -380,6 +408,21 @@ class SheetView(ttk.Frame):
             if len(self.pages) > 1 and not self.pages[-1]:
                 self.pages.pop()
             self.page = max(0, min(self.page, len(self.pages) - 1))
+
+            self._geo = {
+                "cols": [dim.width if (dim and dim.width) else DEFAULT_COL_WIDTH
+                         for dim in (ws.column_dimensions.get(idx_to_col(c))
+                                     for c in range(1, max_col + 1))],
+                "plan": [
+                    ("row", (ws.row_dimensions.get(p).height
+                             if ws.row_dimensions.get(p) and ws.row_dimensions.get(p).height
+                             else DEFAULT_ROW_HEIGHT)) if k == "row"
+                    else ("hf", max((t.count("\n") + 1 for _c, t in p), default=1))
+                    if k in ("hf_top", "hf_bottom") else ("sep", 0)
+                    for k, p in plan],
+            }
+            if dry:
+                return 0
 
             grid_row_of: dict[int, int] = {}
             for idx, (kind, payload) in enumerate(plan):

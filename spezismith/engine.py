@@ -4,8 +4,8 @@ SpeziSmith - Kern-Engine
 Liest Spezifikations-Vorlagen (xlsx), stellt jedes Feld als waehlbare
 Ersetzungsregel bereit und schreibt geaenderte Werte per ZIP/XML-Surgery
 zurueck. Dadurch bleiben eingebettete Bilder (Firmenlogo), VML-Grafiken,
-ActiveX-Steuerelemente, Formatierungen und Druckeinstellungen vollstaendig
-erhalten - im Gegensatz zu einem openpyxl-Roundtrip.
+ActiveX-Steuerelemente, Formatierungen und Druckeinstellungen erhalten; bei
+Zeilenaenderungen werden VML-Steuerelemente passend mitverschoben.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import copy
 import difflib
+import posixpath
 import re
 import shutil
 import zipfile
@@ -403,6 +404,27 @@ def _first_sheet_path(zf: zipfile.ZipFile) -> str:
     raise ValueError("Tabellen-Relationship nicht gefunden.")
 
 
+def _sheet_vml_paths(zf: zipfile.ZipFile, sheet_path: str) -> set[str]:
+    rels_path = posixpath.join(
+        posixpath.dirname(sheet_path), "_rels",
+        posixpath.basename(sheet_path) + ".rels")
+    try:
+        rels_root = ET.fromstring(zf.read(rels_path))
+    except KeyError:
+        return set()
+    paths = set()
+    for rel in rels_root.findall(f"{{{PKG_REL_NS}}}Relationship"):
+        if not rel.get("Type", "").endswith("/vmlDrawing"):
+            continue
+        target = rel.get("Target", "")
+        if target.startswith("/"):
+            paths.add(target.lstrip("/"))
+        else:
+            paths.add(posixpath.normpath(
+                posixpath.join(posixpath.dirname(sheet_path), target)))
+    return paths
+
+
 def _merge_anchor_map(sheet_root: ET.Element) -> dict[str, str]:
     mapping: dict[str, str] = {}
     merge_cells = sheet_root.find(f"{{{MAIN_NS}}}mergeCells")
@@ -744,6 +766,42 @@ def _shift_rows_in_ref(ref: str, at: int, delta: int = 1) -> str:
         ref)
 
 
+def _shift_vml_rows(xml_text: str, shifts: list[tuple[int, int]]) -> str:
+    """Verschiebt VML-Steuerelemente zusammen mit eingefuegten Tabellenzeilen."""
+    def shift_zero_based(row: int) -> int:
+        for at, delta in shifts:
+            if row >= at - 1:
+                row += delta
+        return row
+
+    anchor_re = re.compile(
+        r"(<(?:[\w.-]+:)?Anchor\b[^>]*>)(.*?)(</(?:[\w.-]+:)?Anchor\s*>)",
+        re.DOTALL)
+
+    def shift_anchor(match: re.Match) -> str:
+        parts = match.group(2).split(",")
+        if len(parts) != 8:
+            raise ValueError("Ungueltiger VML-Zellanker.")
+        for index in (2, 6):
+            row_match = re.fullmatch(r"(\s*)(-?\d+)(\s*)", parts[index])
+            if row_match is None:
+                raise ValueError("Ungueltige Zeile in VML-Zellanker.")
+            row = shift_zero_based(int(row_match.group(2)))
+            parts[index] = f"{row_match.group(1)}{row}{row_match.group(3)}"
+        return match.group(1) + ",".join(parts) + match.group(3)
+
+    xml_text = anchor_re.sub(shift_anchor, xml_text)
+    row_re = re.compile(
+        r"(<(?:[\w.-]+:)?Row\b[^>]*>)(\s*)(-?\d+)(\s*)(</(?:[\w.-]+:)?Row\s*>)")
+
+    def shift_row_tag(match: re.Match) -> str:
+        row = shift_zero_based(int(match.group(3)))
+        return (match.group(1) + match.group(2) + str(row) + match.group(4)
+                + match.group(5))
+
+    return row_re.sub(shift_row_tag, xml_text)
+
+
 def _merge_bottom(root: ET.Element, coord: str) -> int:
     """Letzte Zeile des verbundenen Bereichs, der `coord` enthaelt (sonst die eigene)."""
     col_s, row = split_coord(coord)
@@ -1061,8 +1119,9 @@ def apply_to_file(
 ) -> FileResult:
     """
     Wendet Ersetzungsregeln auf eine Spezifikation an und schreibt das
-    Ergebnis nach `target`. Alle anderen ZIP-Bestandteile (Logo, VML,
-    ActiveX, Stile, Druckeinstellungen) bleiben byte-identisch erhalten.
+    Ergebnis nach `target`. Nicht betroffene ZIP-Bestandteile bleiben
+    byte-identisch erhalten; VML-Steuerelemente werden bei Zeilenaenderungen
+    passend mitverschoben.
     """
     result = FileResult(source=source, target=target)
     result.language = detect_language(source)
@@ -1203,6 +1262,7 @@ def apply_to_file(
 
             os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
             tmp_target = target + ".tmp"
+            vml_paths = _sheet_vml_paths(zin, sheet_path) if shifts else set()
             with zipfile.ZipFile(tmp_target, "w", zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
                     if item.filename == sheet_path:
@@ -1212,6 +1272,10 @@ def apply_to_file(
                         for at, delta in shifts:
                             wb_xml = _shift_print_area(wb_xml, at, delta)
                         zout.writestr(item, wb_xml.encode("utf-8"))
+                    elif item.filename in vml_paths:
+                        vml_xml = zin.read(item.filename).decode("utf-8")
+                        vml_xml = _shift_vml_rows(vml_xml, shifts)
+                        zout.writestr(item, vml_xml.encode("utf-8"))
                     else:
                         zout.writestr(item, zin.read(item.filename))
             shutil.move(tmp_target, target)

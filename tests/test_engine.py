@@ -2,6 +2,7 @@
 
 import os
 import zipfile
+import xml.etree.ElementTree as ET
 
 import openpyxl
 import pytest
@@ -485,6 +486,20 @@ def test_structure_sync_replaces_and_inserts_rows(tmp_path):
     merged = {str(r) for r in ws.merged_cells.ranges}
     assert {"A44:C44", "D44:K44", "A45:A46", "B45:K46"} <= merged
     assert "A43:C43" in merged
+    with zipfile.ZipFile(TPL_DE) as source_zip, zipfile.ZipFile(out) as out_zip:
+        source_vml = ET.fromstring(
+            source_zip.read("xl/drawings/vmlDrawing1.vml"))
+        out_vml = ET.fromstring(out_zip.read("xl/drawings/vmlDrawing1.vml"))
+
+        def anchor_rows(root):
+            return [
+                int(anchor.text.split(",")[2].strip())
+                for anchor in root.iter()
+                if anchor.tag.endswith("}Anchor")
+            ]
+
+        assert anchor_rows(out_vml) == [
+            row + 1 for row in anchor_rows(source_vml)]
 
 
 def test_structure_sync_keeps_product_values(tmp_path):

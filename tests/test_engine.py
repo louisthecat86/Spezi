@@ -471,6 +471,41 @@ def _modified_template(tmp_path):
     return str(path)
 
 
+def _checkbox_rows(path):
+    """Zeilenanker (0-basiert) aller Kontrollkaestchen aus den drei Quellen."""
+    import re as _re
+    with zipfile.ZipFile(path) as z:
+        sheet = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        drawing = z.read("xl/drawings/drawing1.xml").decode("utf-8")
+        vml = z.read("xl/drawings/vmlDrawing1.vml").decode("utf-8")
+    pair = r"<xdr:col>(\d+)</xdr:col><xdr:colOff>\d+</xdr:colOff><xdr:row>(\d+)</xdr:row>"
+    vml_anchors = [a.split(",") for a in
+                   _re.findall(r"<x:Anchor>\s*([^<]*?)\s*</x:Anchor>", vml)]
+    return {
+        "sheet": [(int(c), int(r)) for c, r in _re.findall(pair, sheet)],
+        "drawing": [(int(c), int(r)) for c, r in _re.findall(pair, drawing)],
+        "vml": [(int(p[0]), int(p[2])) for p in vml_anchors],
+    }
+
+
+def _assert_checkboxes_follow_rows(source, result):
+    """Jedes Kaestchen muss in der Zeile mit derselben Beschriftung bleiben."""
+    def labels(path):
+        ws = openpyxl.load_workbook(path).active
+        return {r: str(ws.cell(r, 1).value or "").strip()[:25]
+                for r in range(1, ws.max_row + 2)}
+
+    src_labels, res_labels = labels(source), labels(result)
+    before, after = _checkbox_rows(source), _checkbox_rows(result)
+    for kind, anchors in before.items():
+        assert len(anchors) > 0 and len(anchors) == len(after[kind]), kind
+        for (col, row), (new_col, new_row) in zip(anchors, after[kind]):
+            assert new_col == col
+            assert src_labels[row + 1] == res_labels[new_row + 1], (
+                f"{kind}: Kaestchen von '{src_labels[row + 1]}' (Zeile {row + 1}) "
+                f"steht jetzt bei '{res_labels[new_row + 1]}' (Zeile {new_row + 1})")
+
+
 def test_structure_sync_replaces_and_inserts_rows(tmp_path):
     tpl = _modified_template(tmp_path)
     out = tmp_path / "out.xlsx"
@@ -486,39 +521,7 @@ def test_structure_sync_replaces_and_inserts_rows(tmp_path):
     merged = {str(r) for r in ws.merged_cells.ranges}
     assert {"A44:C44", "D44:K44", "A45:A46", "B45:K46"} <= merged
     assert "A43:C43" in merged
-    with zipfile.ZipFile(TPL_DE) as source_zip, zipfile.ZipFile(out) as out_zip:
-        source_vml = ET.fromstring(
-            source_zip.read("xl/drawings/vmlDrawing1.vml"))
-        out_vml = ET.fromstring(out_zip.read("xl/drawings/vmlDrawing1.vml"))
-        source_drawing = ET.fromstring(
-            source_zip.read("xl/drawings/drawing1.xml"))
-        out_drawing = ET.fromstring(out_zip.read("xl/drawings/drawing1.xml"))
-
-        def anchor_rows(root):
-            return [
-                int(anchor.text.split(",")[2].strip())
-                for anchor in root.iter()
-                if anchor.tag.endswith("}Anchor")
-            ]
-
-        assert anchor_rows(out_vml) == [
-            row + 1 for row in anchor_rows(source_vml)]
-
-        def drawing_anchor_rows(root):
-            rows = []
-            for anchor in root.iter():
-                if not anchor.tag.endswith("twoCellAnchor"):
-                    continue
-                for endpoint in anchor:
-                    if endpoint.tag.endswith(("from", "to")):
-                        row = next(
-                            child for child in endpoint
-                            if child.tag.endswith("row"))
-                        rows.append(int(row.text))
-            return rows
-
-        assert drawing_anchor_rows(out_drawing) == [
-            row + 1 for row in drawing_anchor_rows(source_drawing)]
+    _assert_checkboxes_follow_rows(TPL_DE, out)
 
 
 def test_structure_sync_keeps_product_values(tmp_path):
@@ -558,3 +561,41 @@ def test_rules_below_inserted_row_keep_their_cells(tmp_path):
     assert ws["B2"].value == "oben"
     assert ws["B3"].value is None
     assert ws["B4"].value == "unten"
+
+
+def _insert_template_row(ws, at, label):
+    ws.insert_rows(at)
+    for rng in list(ws.merged_cells.ranges):
+        if rng.min_row >= at:
+            ws.merged_cells.remove(rng)
+            ws.merge_cells(start_row=rng.min_row + 1, end_row=rng.max_row + 1,
+                           start_column=rng.min_col, end_column=rng.max_col)
+    ws.cell(at, 1, label)
+    ws.cell(at, 4, "x")
+    ws.merge_cells(start_row=at, end_row=at, start_column=1, end_column=3)
+    ws.merge_cells(start_row=at, end_row=at, start_column=4, end_column=11)
+
+
+@pytest.mark.parametrize("insert_at", [[44], [9], [70], [44, 20]])
+def test_checkboxes_follow_inserted_rows(tmp_path, insert_at):
+    wb = openpyxl.load_workbook(TPL_DE)
+    for n, at in enumerate(insert_at):
+        _insert_template_row(wb.active, at, f"Neue Zeile {n}")
+    tpl = tmp_path / "tpl.xlsx"
+    wb.save(tpl)
+    out = tmp_path / "out.xlsx"
+    res = apply_to_file(TPL_DE, str(out), [], template=str(tpl))
+    assert res.ok, res.error
+    assert len(res.structure_notes) == len(insert_at)
+    _assert_checkboxes_follow_rows(TPL_DE, out)
+
+
+def test_checkboxes_follow_rule_inserted_row(tmp_path):
+    out = tmp_path / "out.xlsx"
+    rule = Rule(coord="D44", new="NEU", expected="x", label="Test",
+                anchor_text="Test", anchor_coord="A44",
+                context_above=["GVO-Status:"], allow_insert=True)
+    res = apply_to_file(TPL_DE, str(out), [rule])
+    assert res.ok, res.error
+    assert any("eingefügt" in c.message for c in res.cells)
+    _assert_checkboxes_follow_rows(TPL_DE, out)

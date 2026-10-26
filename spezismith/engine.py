@@ -27,6 +27,7 @@ MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
+XDR_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 
 # Markerzellen zur Spracherkennung (A3 = Dokumenttitel)
 LANG_MARKERS = {
@@ -820,6 +821,21 @@ def _shift_drawing_rows(xml_text: str, shifts: list[tuple[int, int]]) -> str:
     return row_re.sub(shift_row, xml_text)
 
 
+def _shift_sheet_controls(root: ET.Element,
+                          shifts: list[tuple[int, int]]) -> None:
+    """
+    Verschiebt die Zeilenanker der Formularsteuerelemente (Kontrollkaestchen)
+    im <controls>-Block des Arbeitsblatts. Excel liest die Position von dort,
+    nicht aus der VML-/DrawingML-Datei.
+    """
+    for row_el in root.iter(f"{{{XDR_NS}}}row"):
+        row = int((row_el.text or "0").strip())
+        for at, delta in shifts:
+            if row >= at - 1:
+                row += delta
+        row_el.text = str(max(row, 0))
+
+
 def _merge_bottom(root: ET.Element, coord: str) -> int:
     """Letzte Zeile des verbundenen Bereichs, der `coord` enthaelt (sonst die eigene)."""
     col_s, row = split_coord(coord)
@@ -1274,6 +1290,8 @@ def apply_to_file(
                     status="geaendert", message=via_texts.get(via, ""),
                 ))
 
+            if shifts:
+                _shift_sheet_controls(root, shifts)
             new_xml = _XML_DECL + ET.tostring(root, encoding="unicode")
             new_xml = _restore_namespaces(new_xml, ns_decls)
             _validate_sheet_xml(new_xml)

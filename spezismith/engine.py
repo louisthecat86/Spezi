@@ -11,6 +11,7 @@ erhalten - im Gegensatz zu einem openpyxl-Roundtrip.
 from __future__ import annotations
 
 import os
+import copy
 import difflib
 import re
 import shutil
@@ -140,6 +141,7 @@ class FileResult:
     ok: bool = False
     language: Optional[str] = None
     cells: list[CellResult] = field(default_factory=list)
+    structure_notes: list[str] = field(default_factory=list)
     error: str = ""
 
     @property
@@ -735,10 +737,10 @@ def _find_or_create_cell(sheet_data: ET.Element, coord: str) -> ET.Element:
 _REF_RE = re.compile(r"(\$?[A-Z]{1,3}\$?)(\d+)")
 
 
-def _shift_rows_in_ref(ref: str, at: int) -> str:
-    """Verschiebt alle Zeilennummern >= `at` in einem Bezug/Bereich um 1."""
+def _shift_rows_in_ref(ref: str, at: int, delta: int = 1) -> str:
+    """Verschiebt alle Zeilennummern >= `at` in einem Bezug/Bereich um `delta`."""
     return _REF_RE.sub(
-        lambda m: f"{m.group(1)}{int(m.group(2)) + (1 if int(m.group(2)) >= at else 0)}",
+        lambda m: f"{m.group(1)}{int(m.group(2)) + (delta if int(m.group(2)) >= at else 0)}",
         ref)
 
 
@@ -759,7 +761,8 @@ def _merge_bottom(root: ET.Element, coord: str) -> int:
 
 
 def _insert_row(root: ET.Element, sheet_data: ET.Element, after_row: int,
-                model_row: int) -> int:
+                model_row: int, clone_merges: bool = True,
+                model_el: Optional[ET.Element] = None) -> int:
     """
     Fuegt direkt unter `after_row` eine leere Zeile ein (Stil und
     Zellverbunde von `model_row` uebernommen); alles darunter rutscht nach
@@ -768,10 +771,9 @@ def _insert_row(root: ET.Element, sheet_data: ET.Element, after_row: int,
     at = after_row + 1
     m = lambda tag: f"{{{MAIN_NS}}}{tag}"  # noqa: E731
 
-    model_el = None
     for row_el in sheet_data.findall(m("row")):
         r = int(row_el.get("r"))
-        if r == model_row:
+        if r == model_row and model_el is None:
             model_el = row_el
         if r >= at:
             row_el.set("r", str(r + 1))
@@ -801,7 +803,7 @@ def _insert_row(root: ET.Element, sheet_data: ET.Element, after_row: int,
             ref = mcell.get("ref", "")
             if ":" in ref:
                 (c1, r1), (c2, r2) = (split_coord(x) for x in ref.split(":"))
-                if r1 == r2 == model_row:
+                if clone_merges and r1 == r2 == model_row:
                     clones.append(f"{c1}{at}:{c2}{at}")
             mcell.set("ref", _shift_rows_in_ref(ref, at))
         for ref in clones:
@@ -822,10 +824,10 @@ def _insert_row(root: ET.Element, sheet_data: ET.Element, after_row: int,
     return at
 
 
-def _shift_print_area(wb_xml: str, at: int) -> str:
-    """Zieht Druckbereiche in workbook.xml bei einer eingefuegten Zeile nach."""
+def _shift_print_area(wb_xml: str, at: int, delta: int = 1) -> str:
+    """Zieht Druckbereiche in workbook.xml bei eingefuegten/geloeschten Zeilen nach."""
     def fix(m):
-        return m.group(1) + _shift_rows_in_ref(m.group(2), at) + m.group(3)
+        return m.group(1) + _shift_rows_in_ref(m.group(2), at, delta) + m.group(3)
     return re.sub(
         r'(<definedName[^>]*name="_xlnm\.Print_Area"[^>]*>)([^<]*)(</definedName>)',
         fix, wb_xml)
@@ -881,11 +883,189 @@ def _similar_cell(rule: Rule, texts: dict[str, str],
     return anchor_of.get(best, best) if best and best_ratio >= 0.75 else None
 
 
+# ---------------------------------------------------------------------------
+# Zeilenstruktur an die Vorlage angleichen
+# ---------------------------------------------------------------------------
+
+def _row_key(text: str) -> str:
+    """Vergleichsschluessel einer Beschriftung (ohne Satzzeichen/Ziffern)."""
+    return re.sub(r"[^a-zäöüß]+", "", norm_text(text).lower())
+
+
+def _keyed_rows(texts: dict[str, str]) -> list[tuple[int, str]]:
+    """Zeilen mit Beschriftung in Spalte A (Zeile, Schluessel), aufsteigend."""
+    rows: dict[int, str] = {}
+    for coord, t in texts.items():
+        col, row = split_coord(coord)
+        if col == "A" and _row_key(t):
+            rows[row] = t
+    return [(r, _row_key(rows[r])) for r in sorted(rows)]
+
+
+def _delete_rows(root: ET.Element, sheet_data: ET.Element,
+                 start: int, end: int) -> None:
+    """Loescht die Zeilen start..end; alles darunter rutscht nach oben."""
+    m = lambda tag: f"{{{MAIN_NS}}}{tag}"  # noqa: E731
+    n = end - start + 1
+    for row_el in list(sheet_data.findall(m("row"))):
+        r = int(row_el.get("r"))
+        if start <= r <= end:
+            sheet_data.remove(row_el)
+        elif r > end:
+            row_el.set("r", str(r - n))
+            for c in row_el.findall(m("c")):
+                col_s, _ = split_coord(c.get("r"))
+                c.set("r", f"{col_s}{r - n}")
+    mc = root.find(m("mergeCells"))
+    if mc is not None:
+        for mcell in list(mc.findall(m("mergeCell"))):
+            ref = mcell.get("ref", "")
+            if ":" in ref:
+                (_, r1), (_, r2) = (split_coord(x) for x in ref.split(":"))
+                if start <= r1 and r2 <= end:
+                    mc.remove(mcell)
+                    continue
+            mcell.set("ref", _shift_rows_in_ref(ref, end + 1, -n))
+        mc.set("count", str(len(mc.findall(m("mergeCell")))))
+    dim = root.find(m("dimension"))
+    if dim is not None and dim.get("ref"):
+        dim.set("ref", _shift_rows_in_ref(dim.get("ref"), end + 1, -n))
+    for brk in root.iter(m("brk")):
+        if brk.get("id") and int(brk.get("id")) > end:
+            brk.set("id", str(int(brk.get("id")) - n))
+
+
+def sync_structure(template_path: str, root: ET.Element,
+                   sheet_data: ET.Element, shared: list[str],
+                   shifts: list[tuple[int, int]]) -> list[str]:
+    """
+    Gleicht die Zeilen der Spezifikation an die Vorlage an: Zeilen, die nur in
+    der Vorlage stehen, werden eingefuegt, abweichende Zeilen getauscht und
+    Zeilen, die in der Vorlage fehlen, entfernt. Verglichen wird die
+    Beschriftung in Spalte A; Produktdaten in passenden Zeilen bleiben
+    unangetastet. Gibt eine Liste von Meldungen zurueck.
+    """
+    wb = openpyxl.load_workbook(template_path, data_only=True)
+    try:
+        tws = wb.worksheets[0]
+        tcells = {}
+        for row in tws.iter_rows():
+            for c in row:
+                if c.value is not None and norm_text(c.value):
+                    tcells[c.coordinate] = c.value
+        t_merges = [(r.min_col, r.min_row, r.max_col, r.max_row)
+                    for r in tws.merged_cells.ranges]
+        t_heights = {r: d.height for r, d in tws.row_dimensions.items()
+                     if d.height}
+    finally:
+        wb.close()
+
+    tkeys = _keyed_rows({c: str(v) for c, v in tcells.items()})
+    cells = {c.get("r"): c for c in sheet_data.iter(f"{{{MAIN_NS}}}c")}
+    stexts = {r: t for r, c in cells.items()
+              if (t := _cell_text(c, shared)) and norm_text(t)}
+    skeys = _keyed_rows(stexts)
+
+    def block_end(keys, i, texts_rows_max, bottom_fn):
+        """Letzte Zeile des Blocks von keys[i] (bis zur naechsten Beschriftung)."""
+        row = keys[i][0]
+        last = bottom_fn(row)
+        if i + 1 < len(keys):
+            return max(row, min(last, keys[i + 1][0] - 1))
+        return last
+
+    t_bottom_by_row: dict[int, int] = {}
+    for c1, r1, c2, r2 in t_merges:
+        for r in range(r1, r2 + 1):
+            t_bottom_by_row[r] = max(t_bottom_by_row.get(r, r), r2)
+
+    def t_bottom(row):
+        return t_bottom_by_row.get(row, row)
+
+    def s_bottom(row):
+        return _merge_bottom(root, f"A{row}")
+
+    ops = difflib.SequenceMatcher(
+        None, [k for _, k in skeys], [k for _, k in tkeys],
+        autojunk=False).get_opcodes()
+    notes: list[str] = []
+    # von unten nach oben, damit die Zeilennummern oberhalb gueltig bleiben
+    for tag, i1, i2, j1, j2 in reversed(ops):
+        if tag == "equal":
+            continue
+        t_start = tkeys[j1][0] if j1 < j2 else None
+        t_end = (block_end(tkeys, j2 - 1, 0, t_bottom) if j1 < j2 else None)
+        if i1 < i2:
+            s_start = skeys[i1][0]
+            s_end = block_end(skeys, i2 - 1, 0, s_bottom)
+        elif i1 < len(skeys):
+            s_start, s_end = skeys[i1][0], None
+        else:
+            s_start = (s_bottom(skeys[-1][0]) + 1) if skeys else 1
+            s_end = None
+        labels = [stexts[f"A{skeys[i][0]}"] for i in range(i1, i2)]
+        rows_now = {int(r.get("r")): r
+                    for r in sheet_data.findall(f"{{{MAIN_NS}}}row")}
+        model_src = rows_now.get(s_start)
+        if model_src is None:
+            model_src = rows_now.get(s_start - 1)
+        model_el = copy.deepcopy(model_src) if model_src is not None else None
+        if s_end is not None:
+            _delete_rows(root, sheet_data, s_start, s_end)
+            shifts.append((s_end + 1, -(s_end - s_start + 1)))
+        if t_start is not None:
+            n = t_end - t_start + 1
+            for k in range(n):
+                _insert_row(root, sheet_data, s_start - 1 + k, 0,
+                            clone_merges=False, model_el=model_el)
+                shifts.append((s_start + k, 1))
+            mc = root.find(f"{{{MAIN_NS}}}mergeCells")
+            for c1, r1, c2, r2 in t_merges:
+                if t_start <= r1 and r2 <= t_end and mc is not None:
+                    ref = (f"{idx_to_col(c1)}{r1 - t_start + s_start}:"
+                           f"{idx_to_col(c2)}{r2 - t_start + s_start}")
+                    ET.SubElement(mc, f"{{{MAIN_NS}}}mergeCell", {"ref": ref})
+            if mc is not None:
+                mc.set("count", str(len(mc.findall(f"{{{MAIN_NS}}}mergeCell"))))
+            rows_by_num = {int(r.get("r")): r
+                           for r in sheet_data.findall(f"{{{MAIN_NS}}}row")}
+            for coord, value in tcells.items():
+                col_s, r = split_coord(coord)
+                if t_start <= r <= t_end:
+                    cell = _find_or_create_cell(
+                        sheet_data, f"{col_s}{r - t_start + s_start}")
+                    _set_cell_value(cell, _plain(value))
+            for r in range(t_start, t_end + 1):
+                row_el = rows_by_num.get(r - t_start + s_start)
+                if row_el is not None and t_heights.get(r):
+                    row_el.set("ht", str(t_heights[r]))
+                    row_el.set("customHeight", "1")
+            new_labels = [str(tcells[f"A{tkeys[j][0]}"]).strip() for j in range(j1, j2)]
+        else:
+            new_labels = []
+        if tag == "insert":
+            notes.append("Zeile(n) eingefügt: " + "; ".join(new_labels))
+        elif tag == "delete":
+            notes.append("Zeile(n) entfernt: " + "; ".join(norm_text(x) for x in labels))
+        else:
+            notes.append("Zeile(n) getauscht: " + "; ".join(norm_text(x) for x in labels)
+                         + " → " + "; ".join(new_labels))
+    notes.reverse()
+    return notes
+
+
+def _plain(value) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def apply_to_file(
     source: str,
     target: str,
     rules: Iterable[Rule],
     verify: bool = False,
+    template: Optional[str] = None,
 ) -> FileResult:
     """
     Wendet Ersetzungsregeln auf eine Spezifikation an und schreibt das
@@ -895,7 +1075,7 @@ def apply_to_file(
     result = FileResult(source=source, target=target)
     result.language = detect_language(source)
     rules = list(rules)
-    if not rules:
+    if not rules and not template:
         result.error = "Keine Ersetzungsregeln ausgewaehlt."
         return result
 
@@ -915,6 +1095,10 @@ def apply_to_file(
             cells_by_ref: dict[str, ET.Element] = {}
             texts: dict[str, str] = {}
             inserted: list[int] = []
+            shifts: list[tuple[int, int]] = []
+            if template:
+                result.structure_notes = sync_structure(
+                    template, root, sheet_data, shared, shifts)
 
             def refresh_state():
                 nonlocal anchor_of
@@ -960,6 +1144,7 @@ def apply_to_file(
                         at = _insert_row(root, sheet_data, after,
                                          coord_key(pos)[0])
                         inserted.append(at)
+                        shifts.append((at, 1))
                         t_col = idx_to_col(col_to_idx(split_coord(rule.coord)[0]))
                         if (rule.anchor_text and rule.anchor_coord
                                 and split_coord(rule.anchor_coord)[1]
@@ -1029,10 +1214,10 @@ def apply_to_file(
                 for item in zin.infolist():
                     if item.filename == sheet_path:
                         zout.writestr(item, new_xml.encode("utf-8"))
-                    elif item.filename == "xl/workbook.xml" and inserted:
+                    elif item.filename == "xl/workbook.xml" and shifts:
                         wb_xml = zin.read(item.filename).decode("utf-8")
-                        for at in sorted(inserted):
-                            wb_xml = _shift_print_area(wb_xml, at)
+                        for at, delta in shifts:
+                            wb_xml = _shift_print_area(wb_xml, at, delta)
                         zout.writestr(item, wb_xml.encode("utf-8"))
                     else:
                         zout.writestr(item, zin.read(item.filename))
@@ -1063,13 +1248,14 @@ def process_batch(
     suffix: str = "",
     verify: bool = False,
     progress: Optional[Callable[[int, int, FileResult], None]] = None,
+    template: Optional[str] = None,
 ) -> list[FileResult]:
     """Verarbeitet mehrere Spezifikationen nacheinander in einen Zielordner."""
     sources = list(sources)
     results: list[FileResult] = []
     for i, src in enumerate(sources, start=1):
         target = unique_target_path(out_dir, os.path.basename(src), suffix)
-        res = apply_to_file(src, target, rules, verify=verify)
+        res = apply_to_file(src, target, rules, verify=verify, template=template)
         results.append(res)
         if progress:
             progress(i, len(sources), res)

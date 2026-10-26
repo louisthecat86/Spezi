@@ -173,6 +173,7 @@ class SpeziSmithApp:
         self.counter_var = tk.StringVar(value="Keine Änderungen")
         self.template_var = tk.StringVar(value="Keine Vorlage geladen")
         self.adopt_var = tk.BooleanVar(value=False)
+        self.sync_var = tk.BooleanVar(value=self.cfg.get("sync_structure", True))
         self._layout_ref: dict = {}
         self._progress_started_at: float | None = None
         self._progress_total = 0
@@ -540,6 +541,15 @@ class SpeziSmithApp:
                            "werden übersprungen und im Log gemeldet. Leere "
                            "Eingabefelder werden nur befüllt, wenn sie in der "
                            "Zieldatei leer sind.")
+        sync_cb = ttk.Checkbutton(
+            opt, text="Zeilen der Vorlage übernehmen (einfügen/tauschen)",
+            variable=self.sync_var)
+        sync_cb.pack(anchor="w", pady=(2, 0))
+        ToolTip(sync_cb, "Gleicht den Aufbau jeder Spezifikation an die Vorlage an: "
+                         "Zeilen, die nur in der Vorlage stehen, werden eingefügt, "
+                         "abweichende Zeilen (Beschriftung in Spalte A) getauscht, "
+                         "überzählige entfernt. Werte in passenden Zeilen "
+                         "(Produktdaten) bleiben unverändert.")
         layout_cb = ttk.Checkbutton(
             opt, text="Layout-Prüfung (empfohlen)", variable=self.layout_check)
         layout_cb.pack(anchor="w", pady=(2, 0))
@@ -789,7 +799,7 @@ class SpeziSmithApp:
             return
 
         rules = self._collect_rules()
-        if not rules:
+        if not rules and not self.sync_var.get():
             messagebox.showwarning(
                 APP_NAME,
                 "Bitte zuerst in Schritt 1 mindestens ein Feld anklicken\n"
@@ -827,9 +837,13 @@ class SpeziSmithApp:
         self._worker = threading.Thread(
             target=self._batch_worker,
             args=(files, rules, out_dir, self.suffix.get(), self.verify.get(),
-                  self.layout_check.get(), self._layout_ref_for(rules)),
+                  self.layout_check.get(), self._layout_ref_for(rules),
+                  self._sync_template()),
             daemon=True)
         self._worker.start()
+
+    def _sync_template(self):
+        return self.template_path if self.sync_var.get() else None
 
     def _layout_ref_for(self, rules: list[Rule]) -> dict:
         """Vorlagen-Fingerabdruck ohne die Zellen, die ohnehin geändert werden."""
@@ -838,7 +852,7 @@ class SpeziSmithApp:
                 if k.split("!", 1)[-1] not in changed or not k.startswith("0!")}
 
     def _batch_worker(self, files, rules, out_dir, suffix, verify,
-                      layout_check, layout_ref):
+                      layout_check, layout_ref, sync=None):
         errors = []
         for i, src in enumerate(files, start=1):
             name = os.path.basename(src)
@@ -853,20 +867,22 @@ class SpeziSmithApp:
                                          f"Tipp: Layout-Prüfung in Schritt 2 "
                                          f"abschalten, falls die Datei passt.", ""))
                     else:
-                        self._apply_one(src, out_dir, suffix, rules, verify, errors)
+                        self._apply_one(src, out_dir, suffix, rules, verify, errors, sync)
                 else:
-                    self._apply_one(src, out_dir, suffix, rules, verify, errors)
+                    self._apply_one(src, out_dir, suffix, rules, verify, errors, sync)
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
                 self._queue.put(("log", name, "err", f"Fehler: {exc}", ""))
             self._queue.put(("progress", i))
         self._queue.put(("done", len(files), errors))
 
-    def _apply_one(self, src, out_dir, suffix, rules, verify, errors):
+    def _apply_one(self, src, out_dir, suffix, rules, verify, errors, sync=None):
         target = unique_target_path(out_dir, os.path.basename(src), suffix)
-        res = apply_to_file(src, target, rules, verify=verify)
+        res = apply_to_file(src, target, rules, verify=verify, template=sync)
         if res.ok:
             msg = f"{res.changed_count} Feld(er) geändert"
+            if res.structure_notes:
+                msg += f", {len(res.structure_notes)} Zeilenänderung(en)"
             if res.skipped_count:
                 msg += f", {res.skipped_count} übersprungen"
             self._queue.put(("log", os.path.basename(src), "ok", msg, target))
@@ -884,6 +900,7 @@ class SpeziSmithApp:
         layout_check = self.layout_check.get()
         layout_ref = self._layout_ref_for(rules)
         verify = self.verify.get()
+        sync = self._sync_template()
         self._start_progress(len(files))
         self.open_btn.configure(state="disabled")
         self.status_var.set(f"Verarbeite {len(files)} Datei(en)…")
@@ -921,14 +938,18 @@ class SpeziSmithApp:
             try:
                 res = self._run_dialog_step(
                     lambda: apply_to_file(
-                        src, target, rules, verify=verify))
+                        src, target, rules, verify=verify,
+                        template=sync))
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
                 self._log(name, "err", f"Fehler: {exc}", "")
                 self._mark_progress_done(i)
                 continue
             if res.ok:
-                self._log(name, "ok", f"{res.changed_count} Feld(er) geändert", target)
+                msg = f"{res.changed_count} Feld(er) geändert"
+                if res.structure_notes:
+                    msg += f", {len(res.structure_notes)} Zeilenänderung(en)"
+                self._log(name, "ok", msg, target)
                 self._last_out_dir = os.path.dirname(target)
             else:
                 errors.append(f"{name}: {res.error}")
@@ -1113,6 +1134,7 @@ class SpeziSmithApp:
             "suffix": self.suffix.get(),
             "verify": self.verify.get(),
             "layout_check": self.layout_check.get(),
+            "sync_structure": self.sync_var.get(),
             "replace_mode": self.replace_mode.get(),
             "zoom": self.zoom_var.get(),
         })

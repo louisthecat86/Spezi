@@ -443,3 +443,63 @@ def test_multiline_cell_with_other_date_and_initials(tmp_path):
     ws = openpyxl.load_workbook(out).active
     assert ws["A2"].value == "26.10.2026\nXY\n"
     assert ws["A3"].value == "Ende"
+
+
+# ---------------------------------------------------------------------------
+# Zeilenstruktur der Vorlage uebernehmen
+# ---------------------------------------------------------------------------
+
+def _modified_template(tmp_path):
+    """Vorlage wie vom Anwender: 'Bestrahlung' -> 'Test 1', plus Zeile 'Test'."""
+    wb = openpyxl.load_workbook(TPL_DE)
+    ws = wb.active
+    ws["A43"] = "Test 1"
+    ws["D43"] = "Wert Test 1"
+    ws.insert_rows(44)
+    for rng in list(ws.merged_cells.ranges):
+        if rng.min_row >= 44:
+            ws.merged_cells.remove(rng)
+            ws.merge_cells(start_row=rng.min_row + 1, end_row=rng.max_row + 1,
+                           start_column=rng.min_col, end_column=rng.max_col)
+    ws["A44"] = "Test"
+    ws["D44"] = "Wert Test"
+    ws.merge_cells("A44:C44")
+    ws.merge_cells("D44:K44")
+    path = tmp_path / "tpl.xlsx"
+    wb.save(path)
+    return str(path)
+
+
+def test_structure_sync_replaces_and_inserts_rows(tmp_path):
+    tpl = _modified_template(tmp_path)
+    out = tmp_path / "out.xlsx"
+    res = apply_to_file(TPL_DE, str(out), [], template=tpl)
+    assert res.ok, res.error
+    assert res.structure_notes
+    ws = openpyxl.load_workbook(out).active
+    assert ws["A42"].value == "GVO-Status:"
+    assert ws["A43"].value == "Test 1" and ws["D43"].value == "Wert Test 1"
+    assert ws["A44"].value == "Test" and ws["D44"].value == "Wert Test"
+    assert ws["A45"].value == "Allergene:"
+    assert ws["A87"].value.startswith("Dieses Dokument")
+    merged = {str(r) for r in ws.merged_cells.ranges}
+    assert {"A44:C44", "D44:K44", "A45:A46", "B45:K46"} <= merged
+    assert "A43:C43" in merged
+
+
+def test_structure_sync_keeps_product_values(tmp_path):
+    tpl = _modified_template(tmp_path)
+    wb = openpyxl.load_workbook(TPL_DE)
+    wb.active["C5"] = "Artikel 4711"
+    spec = tmp_path / "spec.xlsx"
+    wb.save(spec)
+    out = tmp_path / "out.xlsx"
+    res = apply_to_file(str(spec), str(out), [], template=tpl)
+    assert res.ok, res.error
+    assert openpyxl.load_workbook(out).active["C5"].value == "Artikel 4711"
+
+
+def test_structure_sync_identical_template_changes_nothing(tmp_path):
+    out = tmp_path / "out.xlsx"
+    res = apply_to_file(TPL_DE, str(out), [], template=TPL_DE)
+    assert res.ok and not res.structure_notes

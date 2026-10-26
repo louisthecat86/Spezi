@@ -503,3 +503,24 @@ def test_structure_sync_identical_template_changes_nothing(tmp_path):
     out = tmp_path / "out.xlsx"
     res = apply_to_file(TPL_DE, str(out), [], template=TPL_DE)
     assert res.ok and not res.structure_notes
+
+
+def test_rules_below_inserted_row_keep_their_cells(tmp_path):
+    spec = tmp_path / "spec.xlsx"
+    _mini_spec(spec, [("Titel", None), ("Ende:", None), ("Letzte", None)])
+    out = tmp_path / "out.xlsx"
+    # Vorlage hat zusaetzlich Zeile 2 ("Neu:"); Regeln stehen in Vorlagen-Koordinaten
+    rules = [
+        Rule(coord="B4", new="unten", expected="", label="Letzte"),
+        Rule(coord="B2", new="oben", expected="", label="Neu",
+             anchor_text="Neu:", anchor_coord="A2",
+             context_above=["Titel"], allow_insert=True),
+    ]
+    res = apply_to_file(str(spec), str(out), rules)
+    assert res.ok, res.error
+    ws = openpyxl.load_workbook(out).active
+    assert [ws.cell(r, 1).value for r in range(1, 5)] == [
+        "Titel", "Neu:", "Ende:", "Letzte"]
+    assert ws["B2"].value == "oben"
+    assert ws["B3"].value is None
+    assert ws["B4"].value == "unten"

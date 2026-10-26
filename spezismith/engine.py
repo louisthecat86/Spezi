@@ -833,14 +833,6 @@ def _shift_print_area(wb_xml: str, at: int, delta: int = 1) -> str:
         fix, wb_xml)
 
 
-def _shift_for_inserts(coord: str, inserted: list[int]) -> str:
-    col_s, row = split_coord(coord)
-    for at in sorted(inserted):
-        if at <= row:
-            row += 1
-    return f"{col_s}{row}"
-
-
 def _find_insert_position(rule: Rule, texts: dict[str, str]) -> Optional[str]:
     """Zelle in der Datei, unter deren Zeile das fehlende Feld eingefuegt wird."""
     base_row, _ = coord_key(rule.coord)
@@ -1094,7 +1086,6 @@ def apply_to_file(
 
             cells_by_ref: dict[str, ET.Element] = {}
             texts: dict[str, str] = {}
-            inserted: list[int] = []
             shifts: list[tuple[int, int]] = []
             if template:
                 result.structure_notes = sync_structure(
@@ -1121,6 +1112,11 @@ def apply_to_file(
                 "eingefuegt": "fehlendes Feld neu eingefügt",
             }
 
+            # Von oben nach unten: Vorlagen-Koordinaten gelten, sobald alle
+            # darueberliegenden Zeilen eingefuegt sind (Datei == Vorlage).
+            rules.sort(key=lambda r: (r.coord.startswith(HF_PREFIX),
+                                      0 if r.coord.startswith(HF_PREFIX)
+                                      else coord_key(r.coord)))
             for rule in rules:
                 if rule.coord.startswith(HF_PREFIX):
                     _apply_hf_rule(root, rule, verify, result)
@@ -1143,7 +1139,6 @@ def apply_to_file(
                         after = _merge_bottom(root, pos)
                         at = _insert_row(root, sheet_data, after,
                                          coord_key(pos)[0])
-                        inserted.append(at)
                         shifts.append((at, 1))
                         t_col = idx_to_col(col_to_idx(split_coord(rule.coord)[0]))
                         if (rule.anchor_text and rule.anchor_coord
@@ -1157,8 +1152,6 @@ def apply_to_file(
                         refresh_state()
                         coord = anchor_of.get(f"{t_col}{at}", f"{t_col}{at}")
                         via = "eingefuegt"
-                elif via == "koordinate" and inserted:
-                    coord = _shift_for_inserts(coord, inserted)
                 cell = cells_by_ref.get(coord)
                 if cell is None:
                     cell = _find_or_create_cell(sheet_data, coord)

@@ -13,6 +13,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from spezismith import gui as gui_module  # noqa: E402
 from spezismith.gui import SpeziSmithApp  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -75,7 +76,20 @@ def main():
     out_dir = os.path.join(tmp, "out")
     app.out_dir.set(out_dir)
     app.out_mode.set("folder")
+    apply_one = app._apply_one
+    delayed_first = [True]
+
+    def delay_first_file(*args):
+        if delayed_first[0]:
+            delayed_first[0] = False
+            time.sleep(0.9)
+        apply_one(*args)
+
+    app._apply_one = delay_first_file
     app._handle_files(srcs)
+    pump(app, 0.75)
+    assert app._progress_visible, "Balken erscheint nicht bei längerer Verarbeitung"
+    assert "läuft seit" in app.status_var.get(), app.status_var.get()
 
     # Worker abwarten
     for _ in range(200):
@@ -83,6 +97,7 @@ def main():
         if not (app._worker and app._worker.is_alive()):
             break
     pump(app, 0.3)  # Queue leeren lassen
+    app._apply_one = apply_one
 
     # 4) Ergebnisse pruefen
     outs = sorted(os.listdir(out_dir))
@@ -101,7 +116,21 @@ def main():
     assert len(log_items) == 2, f"Log-Eintraege: {len(log_items)}"
     print("OK: Log enthaelt beide Dateien")
 
-    # 4b) Layout-Pruefung: eine fremde Datei wird uebersprungen
+    # 4b) Auch der "Speichern unter"-Ablauf verarbeitet im Hintergrund
+    dialog_output = os.path.join(tmp, "dialog_output.xlsx")
+    original_save_dialog = gui_module.filedialog.asksaveasfilename
+    layout_check = app.layout_check.get()
+    gui_module.filedialog.asksaveasfilename = lambda **_kwargs: dialog_output
+    app.layout_check.set(False)
+    try:
+        app._process_with_dialogs([srcs[0]], app._collect_rules())
+    finally:
+        gui_module.filedialog.asksaveasfilename = original_save_dialog
+        app.layout_check.set(layout_check)
+    assert os.path.isfile(dialog_output), "Speichern-unter-Ausgabe fehlt"
+    print("OK: Speichern-unter-Verarbeitung funktioniert")
+
+    # 4c) Layout-Pruefung: eine fremde Datei wird uebersprungen
     import openpyxl as _opx
     fremd = os.path.join(tmp, "Fremd.xlsx")
     wb = _opx.Workbook()

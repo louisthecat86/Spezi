@@ -50,7 +50,9 @@ XML-Ebene, kein verlustbehafteter Excel-Roundtrip).
 - 🌙 Hell/Dunkel-Theme
 - 💾 Einstellungen werden portabel in `spezismith_config.json` **neben der EXE**
   gespeichert – ideal für den USB-Stick
-- 📊 Fortschrittsbalken + farbiges Ergebnis-Log (Doppelklick öffnet Zielordner)
+- 📊 Fortschrittsbalken und Restzeitschätzung bei länger laufenden Stapeln
+  (der Balken erscheint nach kurzer Wartezeit; bei einer einzelnen Datei läuft
+  er animiert); dazu farbiges Ergebnis-Log (Doppelklick öffnet Zielordner)
 
 ## Die fertige EXE erhalten
 

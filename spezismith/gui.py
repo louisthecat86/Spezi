@@ -16,6 +16,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -177,6 +178,12 @@ class SpeziSmithApp:
         self.counter_var = tk.StringVar(value="Keine Änderungen")
         self.lang_var = tk.StringVar(value=LANG_LABELS[self.lang])
         self._layout_ref: dict = {}
+        self._progress_started_at: float | None = None
+        self._progress_total = 0
+        self._progress_done = 0
+        self._progress_current = ""
+        self._progress_visible = False
+        self._progress_reveal_job: str | None = None
 
         # Bearbeitungsleiste (Schritt 1)
         self.sel_coord_var = tk.StringVar(value="–")
@@ -566,6 +573,7 @@ class SpeziSmithApp:
         self.progress = ttk.Progressbar(bar, variable=self.progress_var,
                                         maximum=100, length=220)
         self.progress.grid(row=0, column=0, sticky="w")
+        self.progress.grid_remove()
         ttk.Label(bar, textvariable=self.status_var).grid(row=0, column=1,
                                                           sticky="w", padx=10)
 
@@ -726,8 +734,7 @@ class SpeziSmithApp:
             messagebox.showinfo(APP_NAME, "Es läuft bereits eine Verarbeitung.")
             return
 
-        self.progress_var.set(0)
-        self.progress.configure(maximum=len(files))
+        self._start_progress(len(files))
         self.open_btn.configure(state="disabled")
         self.status_var.set(f"Verarbeite {len(files)} Datei(en)…")
 
@@ -748,23 +755,29 @@ class SpeziSmithApp:
                       layout_check, layout_ref):
         errors = []
         for i, src in enumerate(files, start=1):
-            lang = detect_language(src)
-            if lang and lang != self.lang:
-                self._queue.put(("log", os.path.basename(src), "warn",
-                                 f"Sprache passt nicht zur Auswahl "
-                                 f"({LANG_LABELS.get(lang, lang)}) – übersprungen", ""))
-            elif layout_check and layout_ref:
-                sim = layout_similarity(layout_ref, layout_fingerprints(src))
-                if sim < LAYOUT_MIN_SIMILARITY:
-                    self._queue.put(("log", os.path.basename(src), "warn",
-                                     f"Layout weicht ab (nur {sim:.0%} Übereinstimmung"
-                                     f" mit der Vorlage) – übersprungen. "
-                                     f"Tipp: Layout-Prüfung in Schritt 2 "
-                                     f"abschalten, falls die Datei passt.", ""))
+            name = os.path.basename(src)
+            self._queue.put(("file_start", i, name))
+            try:
+                lang = detect_language(src)
+                if lang and lang != self.lang:
+                    self._queue.put(("log", name, "warn",
+                                     f"Sprache passt nicht zur Auswahl "
+                                     f"({LANG_LABELS.get(lang, lang)}) – übersprungen", ""))
+                elif layout_check and layout_ref:
+                    sim = layout_similarity(layout_ref, layout_fingerprints(src))
+                    if sim < LAYOUT_MIN_SIMILARITY:
+                        self._queue.put(("log", name, "warn",
+                                         f"Layout weicht ab (nur {sim:.0%} Übereinstimmung"
+                                         f" mit der Vorlage) – übersprungen. "
+                                         f"Tipp: Layout-Prüfung in Schritt 2 "
+                                         f"abschalten, falls die Datei passt.", ""))
+                    else:
+                        self._apply_one(src, out_dir, suffix, rules, verify, errors)
                 else:
                     self._apply_one(src, out_dir, suffix, rules, verify, errors)
-            else:
-                self._apply_one(src, out_dir, suffix, rules, verify, errors)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+                self._queue.put(("log", name, "err", f"Fehler: {exc}", ""))
             self._queue.put(("progress", i))
         self._queue.put(("done", len(files), errors))
 
@@ -782,19 +795,43 @@ class SpeziSmithApp:
                              f"Fehler: {res.error}", ""))
 
     def _process_with_dialogs(self, files: list[str], rules: list[Rule]):
+        if self._worker and self._worker.is_alive():
+            messagebox.showinfo(APP_NAME, "Es läuft bereits eine Verarbeitung.")
+            return
+
         errors = []
         layout_check = self.layout_check.get()
         layout_ref = self._layout_ref_for(rules)
+        verify = self.verify.get()
+        self._start_progress(len(files))
+        self.open_btn.configure(state="disabled")
+        self.status_var.set(f"Verarbeite {len(files)} Datei(en)…")
         for i, src in enumerate(files, start=1):
             name = os.path.basename(src)
-            lang = detect_language(src)
+            self._progress_current = name
+            try:
+                lang = self._run_dialog_step(lambda: detect_language(src))
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+                self._log(name, "err", f"Fehler: {exc}", "")
+                self._mark_progress_done(i)
+                continue
             if lang and lang != self.lang:
                 self._log(name, "warn",
                           f"Sprache passt nicht zur Auswahl "
                           f"({LANG_LABELS.get(lang, lang)}) – übersprungen", "")
+                self._mark_progress_done(i)
                 continue
             if layout_check and self._layout_ref:
-                sim = layout_similarity(layout_ref, layout_fingerprints(src))
+                try:
+                    sim = self._run_dialog_step(
+                        lambda: layout_similarity(
+                            layout_ref, layout_fingerprints(src)))
+                except Exception as exc:
+                    errors.append(f"{name}: {exc}")
+                    self._log(name, "err", f"Fehler: {exc}", "")
+                    self._mark_progress_done(i)
+                    continue
                 if sim < LAYOUT_MIN_SIMILARITY and not messagebox.askyesno(
                         APP_NAME,
                         f"{name}\n\nLayout weicht ab (nur {sim:.0%} Übereinstimmung "
@@ -802,6 +839,7 @@ class SpeziSmithApp:
                         parent=self.root):
                     self._log(name, "warn",
                               f"Layout weicht ab ({sim:.0%}) – übersprungen", "")
+                    self._mark_progress_done(i)
                     continue
             stem, ext = os.path.splitext(name)
             target = filedialog.asksaveasfilename(
@@ -810,16 +848,26 @@ class SpeziSmithApp:
                 defaultextension=ext, filetypes=FILE_TYPES)
             if not target:
                 self._log(name, "warn", "Speichern abgebrochen", "")
+                self._mark_progress_done(i)
                 continue
-            res = apply_to_file(src, target, rules, verify=self.verify.get())
+            try:
+                res = self._run_dialog_step(
+                    lambda: apply_to_file(
+                        src, target, rules, verify=verify))
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+                self._log(name, "err", f"Fehler: {exc}", "")
+                self._mark_progress_done(i)
+                continue
             if res.ok:
                 self._log(name, "ok", f"{res.changed_count} Feld(er) geändert", target)
                 self._last_out_dir = os.path.dirname(target)
             else:
                 errors.append(f"{name}: {res.error}")
                 self._log(name, "err", f"Fehler: {res.error}", "")
-            self.progress_var.set(i)
+            self._mark_progress_done(i)
         self.status_var.set(f"Fertig – {len(files)} Datei(en) verarbeitet.")
+        self._finish_progress(len(files))
         if errors:
             messagebox.showerror(APP_NAME, "Fehler bei:\n\n" + "\n".join(errors))
         self._save_cfg()
@@ -834,18 +882,116 @@ class SpeziSmithApp:
                     self._log(name, tag, msg, target)
                 elif kind == "progress":
                     self.progress_var.set(item[1])
-                    self.status_var.set(f"Verarbeite… {item[1]} Datei(en) fertig.")
+                    self._progress_done = item[1]
+                elif kind == "file_start":
+                    self._progress_current = item[2]
                 elif kind == "done":
                     _, total, errors = item
-                    self.progress_var.set(total)
-                    self.status_var.set(f"Fertig – {total} Datei(en) verarbeitet.")
-                    self.open_btn.configure(state="normal")
+                    self._finish_progress(total)
                     if errors:
                         messagebox.showerror(
                             APP_NAME, "Fehler bei:\n\n" + "\n".join(errors))
         except queue.Empty:
             pass
+        if (self._progress_visible and self._progress_started_at is not None
+                and self._worker and self._worker.is_alive()):
+            self._update_progress_status()
         self.root.after(60, self._poll_queue)
+
+    def _start_progress(self, total: int):
+        if self._progress_reveal_job is not None:
+            self.root.after_cancel(self._progress_reveal_job)
+            self._progress_reveal_job = None
+        self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=total)
+        self.progress.grid_remove()
+        self.progress_var.set(0)
+        self._progress_started_at = time.monotonic()
+        self._progress_total = total
+        self._progress_done = 0
+        self._progress_current = ""
+        self._progress_visible = False
+        self._progress_reveal_job = self.root.after(
+            700, self._reveal_progress)
+
+    def _finish_progress(self, total: int):
+        if self._progress_reveal_job is not None:
+            self.root.after_cancel(self._progress_reveal_job)
+            self._progress_reveal_job = None
+        self._progress_started_at = None
+        self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=total)
+        self.progress_var.set(total)
+        self.status_var.set(f"Fertig – {total} Datei(en) verarbeitet.")
+        self.open_btn.configure(state="normal")
+
+    def _mark_progress_done(self, count: int):
+        self._progress_done = count
+        self.progress_var.set(count)
+
+    def _run_dialog_step(self, callback):
+        result = []
+        error = []
+        finished = threading.Event()
+
+        def run():
+            try:
+                result.append(callback())
+            except Exception as exc:
+                error.append(exc)
+            finally:
+                finished.set()
+
+        self._worker = threading.Thread(target=run, daemon=True)
+        self._worker.start()
+        wait_var = tk.BooleanVar(value=False)
+
+        def check_finished():
+            if finished.is_set():
+                wait_var.set(True)
+            else:
+                self.root.after(30, check_finished)
+
+        self.root.after(30, check_finished)
+        self.root.wait_variable(wait_var)
+        self._worker.join()
+        self._worker = None
+        if error:
+            raise error[0]
+        return result[0]
+
+    def _reveal_progress(self):
+        self._progress_reveal_job = None
+        if self._progress_started_at is None:
+            return
+        self._progress_visible = True
+        self.progress.grid()
+        if self._progress_total == 1:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
+        self._update_progress_status()
+
+    def _update_progress_status(self):
+        if self._progress_started_at is None:
+            return
+        elapsed = time.monotonic() - self._progress_started_at
+        elapsed_text = self._format_duration(elapsed)
+        current = self._progress_current or "Datei wird vorbereitet"
+        status = (f"{current} · {self._progress_done}/{self._progress_total} "
+                  f"fertig · läuft seit {elapsed_text}")
+        if self._progress_done:
+            remaining = elapsed / self._progress_done * (
+                self._progress_total - self._progress_done)
+            status += f" · noch ca. {self._format_duration(remaining)}"
+        self.status_var.set(status)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        total_seconds = max(0, int(seconds))
+        minutes, seconds = divmod(total_seconds, 60)
+        if minutes:
+            return f"{minutes}:{seconds:02d} min"
+        return f"{seconds} s"
 
     # ------------------------------------------------------------------
     # Diverses

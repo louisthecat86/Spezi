@@ -11,6 +11,7 @@ erhalten - im Gegensatz zu einem openpyxl-Roundtrip.
 from __future__ import annotations
 
 import os
+import difflib
 import re
 import shutil
 import zipfile
@@ -493,28 +494,70 @@ def get_header_footer(path: str) -> dict[str, str]:
 # Layout-Pruefung (Schutz gegen verschobene/falsche Vorlagen)
 # ---------------------------------------------------------------------------
 
-def layout_fingerprints(path: str) -> dict[str, str]:
-    """Alle Textzellen (Koordinate -> normalisierter Text) einer Datei."""
+LAYOUT_MIN_SIMILARITY = 0.6
+
+
+def _sheet_fingerprint(ws) -> dict[str, str]:
+    return {
+        cell.coordinate: norm_text(cell.value)
+        for row in ws.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str) and len(norm_text(cell.value)) >= 4
+    }
+
+
+def layout_fingerprints(path: str, ignore: Optional[set] = None) -> dict[str, str]:
+    """Alle Textzellen der Datei (Koordinate -> normalisierter Text).
+
+    Mehrere Tabellenblätter werden als "Blatt!Koordinate" abgelegt, damit
+    die Prüfung auch bei vertauschter Blattreihenfolge funktioniert.
+    `ignore` = Zellen, die ohnehin geändert werden (Werte, keine Struktur).
+    """
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
-        ws = wb.worksheets[0]
-        return {
-            cell.coordinate: norm_text(cell.value)
-            for row in ws.iter_rows()
-            for cell in row
-            if isinstance(cell.value, str) and len(norm_text(cell.value)) >= 4
-        }
+        result: dict[str, str] = {}
+        for i, ws in enumerate(wb.worksheets):
+            for coord, text in _sheet_fingerprint(ws).items():
+                if ignore and coord in ignore and i == 0:
+                    continue
+                result[f"{i}!{coord}"] = text
+        return result
     finally:
         wb.close()
 
 
+def _split_fp(fp: dict[str, str]) -> dict[int, dict[str, str]]:
+    sheets: dict[int, dict[str, str]] = {}
+    for key, text in fp.items():
+        idx, coord = key.split("!", 1)
+        sheets.setdefault(int(idx), {})[coord] = text
+    return sheets
+
+
 def layout_similarity(reference: dict[str, str], other: dict[str, str]) -> float:
-    """Anteil der Vorlagen-Textzellen, die in der Datei identisch stehen."""
+    """Anteil der Vorlagen-Texte, die sich in der Datei wiederfinden.
+
+    Tolerant gegen verschobene Zeilen/Spalten (Text steht irgendwo im Blatt),
+    gegen Kleinigkeiten (>= 90 % Textähnlichkeit an gleicher Stelle) und gegen
+    geänderte Blattreihenfolge (bestes Blatt zählt).
+    """
     if not reference:
         return 1.0
-    matches = sum(1 for coord, text in reference.items()
-                  if other.get(coord) == text)
-    return matches / len(reference)
+    ref = {k.split("!", 1)[1]: t for k, t in reference.items()
+           if k.startswith("0!")} or {k.split("!", 1)[-1]: t
+                                       for k, t in reference.items()}
+    best = 0.0
+    for sheet in (_split_fp(other) or {0: {}}).values():
+        texts = set(sheet.values())
+        matches = 0
+        for coord, text in ref.items():
+            here = sheet.get(coord)
+            if here == text or text in texts:
+                matches += 1
+            elif here and difflib.SequenceMatcher(None, here, text).ratio() >= 0.9:
+                matches += 1
+        best = max(best, matches / len(ref))
+    return best
 
 
 _NUM_RE = re.compile(r"^-?\d+([.,]\d+)?$")

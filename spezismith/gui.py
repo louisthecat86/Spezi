@@ -35,6 +35,7 @@ from .engine import (
     detect_language,
     layout_fingerprints,
     layout_similarity,
+    LAYOUT_MIN_SIMILARITY,
     unique_target_path,
 )
 from .resources import (
@@ -55,6 +56,53 @@ LANG_EN = "en"
 LANG_LABELS = {LANG_DE: "Deutsch", LANG_EN: "English"}
 
 FILE_TYPES = [("Excel-Spezifikation", "*.xlsx *.xlsm")]
+
+
+def _changed_lines(orig: str, new: str):
+    """Mehrzeilige Zelle: nur die geänderten Zeilen als (find, ersatz).
+
+    So bleiben abweichende Nachbarzeilen in der Zieldatei unangetastet.
+    None = nicht eindeutig teilbar (dann wird die ganze Zelle gesetzt).
+    """
+    a, b = orig.split("\n"), new.split("\n")
+    i = 0
+    while i < min(len(a), len(b)) and a[i] == b[i]:
+        i += 1
+    j = 0
+    while j < min(len(a), len(b)) - i and a[-1 - j] == b[-1 - j]:
+        j += 1
+    mid_a, mid_b = a[i:len(a) - j], b[i:len(b) - j]
+    if not mid_a or not mid_b:
+        return None
+    return "\n".join(mid_a), "\n".join(mid_b)
+
+
+class VarText(tk.Text):
+    """Mehrzeiliges Eingabefeld, das wie ein Entry an eine StringVar gebunden ist."""
+
+    def __init__(self, master, var: tk.StringVar, height: int = 3):
+        super().__init__(master, height=height, width=30, wrap="word",
+                         undo=True, font=("Segoe UI", 10), borderwidth=1,
+                         relief="solid", padx=4, pady=2)
+        self._var = var
+        self.bind("<KeyRelease>", self._to_var)
+        self.bind("<<Paste>>", lambda _e: self.after_idle(self._to_var))
+        self.bind("<<Cut>>", lambda _e: self.after_idle(self._to_var))
+        var.trace_add("write", self._from_var)
+
+    def _to_var(self, _event=None):
+        text = self.get("1.0", "end-1c")
+        if text != self._var.get():
+            self._var.set(text)
+
+    def _from_var(self, *_):
+        text = self._var.get()
+        if text != self.get("1.0", "end-1c"):
+            state = str(self.cget("state"))
+            self.configure(state="normal")
+            self.delete("1.0", "end")
+            self.insert("1.0", text)
+            self.configure(state=state)
 
 
 class ToolTip:
@@ -105,8 +153,8 @@ class SpeziSmithApp:
         else:
             self.root = tk.Tk()
         self.root.title(f"{APP_NAME} {__version__} – Spezifikationen anpassen")
-        self.root.geometry("1240x800")
-        self.root.minsize(1020, 660)
+        self.root.geometry("1400x860")
+        self.root.minsize(1100, 680)
 
         try:
             self.root.iconphoto(True, tk.PhotoImage(
@@ -123,7 +171,7 @@ class SpeziSmithApp:
         self.verify = tk.BooleanVar(value=self.cfg.get("verify", False))
         self.layout_check = tk.BooleanVar(value=self.cfg.get("layout_check", True))
         self.replace_mode = tk.StringVar(value=self.cfg.get("replace_mode", "set"))
-        self.zoom_var = tk.StringVar(value=self.cfg.get("zoom", "100 %"))
+        self.zoom_var = tk.StringVar(value=self.cfg.get("zoom", "Ganze Seite"))
         self.status_var = tk.StringVar(value="Bereit.")
         self.progress_var = tk.DoubleVar(value=0)
         self.counter_var = tk.StringVar(value="Keine Änderungen")
@@ -160,12 +208,17 @@ class SpeziSmithApp:
         main = ttk.Frame(root, padding=(10, 4, 10, 6))
         main.grid(row=1, column=0, sticky="nsew")
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(0, weight=3)
-        main.rowconfigure(2, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        # Links die Seitenansicht (volle Höhe), rechts Ausgabe + Verarbeitung
+        side = ttk.Frame(main)
+        side.grid(row=0, column=1, sticky="ns", padx=(8, 0))
+        side.columnconfigure(0, weight=1)
+        side.rowconfigure(1, weight=1)
 
         self._build_step1(main)
-        self._build_step2(main)
-        self._build_step3(main)
+        self._build_step2(side)
+        self._build_step3(side)
         self._build_statusbar(root)
 
     def _build_header(self, root):
@@ -219,7 +272,7 @@ class SpeziSmithApp:
         bar = ttk.Frame(frame)
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         ttk.Label(bar, text="🔎").pack(side="left")
-        search = ttk.Entry(bar, textvariable=self.search_var, width=30)
+        search = ttk.Entry(bar, textvariable=self.search_var, width=16)
         search.pack(side="left", padx=(2, 4))
         search.bind("<Return>", lambda _e: self._search_next())
         ToolTip(search, "Zelle (z. B. „A5“) oder Text suchen – Enter springt "
@@ -229,17 +282,17 @@ class SpeziSmithApp:
         self.search_info_var = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.search_info_var,
                   foreground="#666666").pack(side="left", padx=(6, 0))
-        ttk.Button(bar, text="Alle Änderungen verwerfen",
-                   command=self._clear_all_changes).pack(side="left", padx=(16, 0))
+        ttk.Button(bar, text="Alle verwerfen",
+                   command=self._clear_all_changes).pack(side="left", padx=(8, 0))
 
-        ttk.Label(bar, text="Zoom:").pack(side="left", padx=(16, 2))
-        zoom_box = ttk.Combobox(bar, textvariable=self.zoom_var, width=6,
+        ttk.Label(bar, text="Zoom:").pack(side="left", padx=(8, 2))
+        zoom_box = ttk.Combobox(bar, textvariable=self.zoom_var, width=11,
                                 state="readonly",
-                                values=["60 %", "70 %", "80 %", "90 %", "100 %",
+                                values=["Ganze Seite", "60 %", "70 %", "80 %", "90 %", "100 %",
                                         "110 %", "125 %", "150 %"])
         zoom_box.pack(side="left")
         zoom_box.bind("<<ComboboxSelected>>", self._on_zoom_change)
-        ToolTip(zoom_box, "Ansicht verkleinern, um die ganze Seite zu sehen")
+        ToolTip(zoom_box, "„Ganze Seite“ passt die Seite ohne Scrollen ein; Seitenwechsel unter der Ansicht")
 
         ttk.Label(bar, textvariable=self.counter_var,
                   foreground=ORANGE, font=("Segoe UI", 10, "bold")
@@ -259,22 +312,22 @@ class SpeziSmithApp:
                   font=("Consolas", 11, "bold"), foreground=NAVY
                   ).grid(row=0, column=1, sticky="w")
         self.orig_label = ttk.Label(edit, textvariable=self.sel_orig_var,
-                                    foreground="#666666", width=44)
-        self.orig_label.grid(row=0, column=2, sticky="w", padx=(4, 10))
+                                    foreground="#666666", width=30)
+        self.orig_label.grid(row=0, column=2, columnspan=5, sticky="ew", padx=(4, 0))
 
-        ttk.Label(edit, text="Neuer Wert:").grid(row=0, column=3, sticky="e")
-        self.new_entry = ttk.Entry(edit, textvariable=self.sel_new_var, width=42)
-        self.new_entry.grid(row=0, column=4, sticky="ew", padx=(4, 6))
+        ttk.Label(edit, text="Neu:").grid(row=1, column=0, sticky="nw", pady=(4, 0))
+        self.new_entry = VarText(edit, self.sel_new_var, height=3)
+        self.new_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=(4, 6), pady=(4, 0))
         self.sel_new_var.trace_add("write", self._on_new_value_typed)
 
         self.clear_cb = ttk.Checkbutton(edit, text="Feld leeren",
                                         variable=self.sel_clear_var,
                                         command=self._on_clear_toggled)
-        self.clear_cb.grid(row=0, column=5)
+        self.clear_cb.grid(row=1, column=4, sticky="n", pady=(4, 0))
         ToolTip(self.clear_cb, "Den Inhalt des gewählten Feldes in allen "
                                "abgelegten Spezifikationen entfernen")
         ttk.Button(edit, text="Zurücknehmen", width=13,
-                   command=self._revert_current).grid(row=0, column=6, padx=(6, 0))
+                   command=self._revert_current).grid(row=1, column=5, sticky="n", padx=(6, 0), pady=(4, 0))
 
         self._edit_widgets = (self.new_entry, self.clear_cb)
         self._set_edit_enabled(False)
@@ -303,7 +356,7 @@ class SpeziSmithApp:
             tip += "\n\nHinweis: &P = Seitenzahl, &N = Seiten gesamt, &G = Grafik"
         ToolTip(self.orig_label, tip)
         self._edit_guard = True
-        self.sel_new_var.set(cell.new_text or "")
+        self.sel_new_var.set(orig if cell.new_text is None else cell.new_text)
         self.sel_clear_var.set(cell.new_text == "")
         self._edit_guard = False
         self._set_edit_enabled(True)
@@ -322,7 +375,8 @@ class SpeziSmithApp:
         if not coord or self.sel_clear_var.get():
             return
         text = self.sel_new_var.get()
-        self.sheet.set_new_value(coord, text if text else None)
+        unchanged = not text or text == self.sheet.orig_value(coord)
+        self.sheet.set_new_value(coord, None if unchanged else text)
         self._refresh_counter()
 
     def _on_clear_toggled(self):
@@ -337,8 +391,10 @@ class SpeziSmithApp:
             self.sheet.set_new_value(coord, "")
         else:
             self.new_entry.configure(state="normal")
-            text = self.sel_new_var.get()
-            self.sheet.set_new_value(coord, text if text else None)
+            self._edit_guard = True
+            self.sel_new_var.set(self.sheet.orig_value(coord))
+            self._edit_guard = False
+            self.sheet.set_new_value(coord, None)
         self._refresh_counter()
 
     def _revert_current(self):
@@ -346,7 +402,7 @@ class SpeziSmithApp:
         if not coord:
             return
         self._edit_guard = True
-        self.sel_new_var.set("")
+        self.sel_new_var.set(self.sheet.orig_value(coord))
         self.sel_clear_var.set(False)
         self._edit_guard = False
         self.new_entry.configure(state="normal")
@@ -356,7 +412,7 @@ class SpeziSmithApp:
     def _clear_all_changes(self):
         self.sheet.clear_all()
         self._edit_guard = True
-        self.sel_new_var.set("")
+        self.sel_new_var.set(self.sheet.orig_value(self._selected_coord or ""))
         self.sel_clear_var.set(False)
         self._edit_guard = False
         self.new_entry.configure(state="normal")
@@ -390,42 +446,44 @@ class SpeziSmithApp:
 
     def _build_step2(self, main):
         frame = ttk.LabelFrame(main, text=" 2 · Ausgabe wählen ", padding=8)
-        frame.grid(row=1, column=0, sticky="ew", pady=6)
+        frame.grid(row=0, column=0, sticky="ew", pady=(2, 6))
+        frame.columnconfigure(0, weight=1)
 
         ttk.Radiobutton(frame, text="Zielordner:", variable=self.out_mode,
-                        value="folder").grid(row=0, column=0, sticky="w")
-        dir_entry = ttk.Entry(frame, textvariable=self.out_dir, width=62)
-        dir_entry.grid(row=0, column=1, sticky="ew", padx=6)
+                        value="folder").grid(row=0, column=0, columnspan=2, sticky="w")
+        dir_entry = ttk.Entry(frame, textvariable=self.out_dir, width=30)
+        dir_entry.grid(row=1, column=0, sticky="ew", padx=(0, 6))
         ttk.Button(frame, text="Durchsuchen…",
-                   command=self._browse_dir).grid(row=0, column=2, padx=(0, 8))
+                   command=self._browse_dir).grid(row=1, column=1)
 
         ttk.Radiobutton(frame, text="Nach jeder Datei fragen („Speichern unter“)",
                         variable=self.out_mode,
-                        value="ask").grid(row=1, column=0, columnspan=2,
+                        value="ask").grid(row=2, column=0, columnspan=2,
                                           sticky="w", pady=(6, 0))
 
-        ttk.Label(frame, text="Dateinamen-Zusatz:").grid(row=0, column=3,
-                                                         sticky="e", padx=(16, 4))
-        suffix_entry = ttk.Entry(frame, textvariable=self.suffix, width=14)
-        suffix_entry.grid(row=0, column=4, sticky="w")
+        suffix_row = ttk.Frame(frame)
+        suffix_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(suffix_row, text="Dateinamen-Zusatz:").pack(side="left")
+        suffix_entry = ttk.Entry(suffix_row, textvariable=self.suffix, width=14)
+        suffix_entry.pack(side="left", padx=6)
         ToolTip(suffix_entry, "Wird an den Dateinamen angehängt, z. B. "
                               "„Spezi_angepasst.xlsx“.\nLeer lassen = Originalname.")
 
         opt = ttk.Frame(frame)
-        opt.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
-        ttk.Label(opt, text="Ersetzungsmodus:").pack(side="left")
+        opt.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(opt, text="Ersetzungsmodus:").pack(anchor="w")
         rb1 = ttk.Radiobutton(opt, text="Ganze Zelle ersetzen",
                               variable=self.replace_mode, value="set")
-        rb1.pack(side="left", padx=(6, 10))
+        rb1.pack(anchor="w", padx=(8, 0))
         rb2 = ttk.Radiobutton(opt, text="Nur Teiltext ersetzen",
                               variable=self.replace_mode, value="replace")
-        rb2.pack(side="left")
+        rb2.pack(anchor="w", padx=(8, 0))
         ToolTip(rb2, "Ersetzt den aktuellen Feldtext innerhalb längerer "
                      "Zelltexte (z. B. Datum im Kopftext).")
         verify_cb = ttk.Checkbutton(
-            opt, text="Nur ersetzen, wenn der aktuelle Wert dem Vorlagenwert entspricht",
+            opt, text="Nur bei gleichem Vorlagenwert ersetzen",
             variable=self.verify)
-        verify_cb.pack(side="left", padx=(20, 0))
+        verify_cb.pack(anchor="w", pady=(6, 0))
         ToolTip(verify_cb, "Sicherheitsoption: Zellen, deren Inhalt in der "
                            "abgelegten Spezifikation vom Vorlagenwert abweicht, "
                            "werden übersprungen und im Log gemeldet. Leere "
@@ -433,12 +491,12 @@ class SpeziSmithApp:
                            "Zieldatei leer sind.")
         layout_cb = ttk.Checkbutton(
             opt, text="Layout-Prüfung (empfohlen)", variable=self.layout_check)
-        layout_cb.pack(side="left", padx=(20, 0))
+        layout_cb.pack(anchor="w", pady=(2, 0))
         ToolTip(layout_cb, "Prüft jede abgelegte Datei vor dem Ersetzen: Weicht "
                            "ihr Layout deutlich von der Vorlage ab (z. B. andere "
                            "Zeilenanzahl), wird sie übersprungen statt falsch "
-                           "befüllt - mit Warnung im Log.")
-        frame.columnconfigure(1, weight=1)
+                           "befüllt - mit Warnung im Log. Verschobene Zeilen "
+                           "und geänderte Werte werden toleriert.")
 
     # ------------------------------------------------------------------
     # Schritt 3: Verarbeiten
@@ -447,7 +505,7 @@ class SpeziSmithApp:
     def _build_step3(self, main):
         frame = ttk.LabelFrame(
             main, text=" 3 · Spezifikationen verarbeiten ", padding=8)
-        frame.grid(row=2, column=0, sticky="nsew", pady=(6, 2))
+        frame.grid(row=1, column=0, sticky="nsew", pady=(0, 2))
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(2, weight=1)
 
@@ -475,13 +533,13 @@ class SpeziSmithApp:
         log_frame.rowconfigure(0, weight=1)
 
         cols = ("file", "result", "target")
-        self.log = ttk.Treeview(log_frame, columns=cols, show="headings", height=5)
+        self.log = ttk.Treeview(log_frame, columns=cols, show="headings", height=4)
         self.log.heading("file", text="Datei")
         self.log.heading("result", text="Ergebnis")
         self.log.heading("target", text="Ziel")
-        self.log.column("file", width=260, anchor="w")
-        self.log.column("result", width=320, anchor="w")
-        self.log.column("target", width=420, anchor="w")
+        self.log.column("file", width=120, anchor="w")
+        self.log.column("result", width=170, anchor="w")
+        self.log.column("target", width=110, anchor="w")
         self.log.tag_configure("ok", foreground="#1E7E34")
         self.log.tag_configure("warn", foreground="#B26A00")
         self.log.tag_configure("err", foreground="#C0392B")
@@ -530,13 +588,13 @@ class SpeziSmithApp:
         fill = "#3a2c18" if (active and dark) else ("#FFF3E2" if active else self._canvas_bg)
         c.create_rectangle(4, 4, w - 4, h - 4, outline=color, width=2,
                            dash=(8, 5), fill=fill)
-        line1 = "⬇  Spezifikationen hierher ziehen (.xlsx) – Mehrfachauswahl möglich"
+        line1 = "⬇  Dateien hierher ziehen (.xlsx)"
         if not self.dnd_ok:
             line1 = "Drag & Drop nicht verfügbar – bitte die Schaltfläche unten nutzen"
         c.create_text(w / 2, h / 2 - 10, text=line1,
                       font=("Segoe UI", 11, "bold"), fill=self._canvas_fg)
         c.create_text(w / 2, h / 2 + 14,
-                      text="z. B. 5 Dateien gleichzeitig aus dem Explorer hereinziehen",
+                      text="Mehrfachauswahl möglich",
                       font=("Segoe UI", 9), fill=self._canvas_muted)
 
     # ------------------------------------------------------------------
@@ -546,6 +604,9 @@ class SpeziSmithApp:
     def _template_path(self) -> str:
         rel = TEMPLATE_DE if self.lang == LANG_DE else TEMPLATE_EN
         return resource_path(rel)
+
+    def _zoom_fit(self) -> bool:
+        return not self.zoom_var.get().strip().endswith("%")
 
     def _zoom_scale(self) -> float:
         try:
@@ -562,7 +623,9 @@ class SpeziSmithApp:
         self.root.update_idletasks()
         try:
             count = self.sheet.load_template(self._template_path(), keep=preserve,
-                                             scale=self._zoom_scale())
+                                             scale=self._zoom_scale(),
+                                             fit=self._zoom_fit(),
+                                             page=self.sheet.page)
             self._layout_ref = layout_fingerprints(self._template_path())
         except Exception as exc:
             messagebox.showerror(APP_NAME,
@@ -592,9 +655,14 @@ class SpeziSmithApp:
                 mode = "set"  # Kopf-/Fußzeile: format-schonender Volltext-Ersatz
             else:
                 label = orig[:40] or coord
+            find, repl, rmode = orig, new, mode
+            if not coord.startswith(HF_PREFIX) and new and "\n" in orig:
+                part = _changed_lines(orig, new)
+                if part:
+                    find, repl, rmode = part[0], part[1], "replace"
             rules.append(Rule(
-                coord=coord, new=new, mode=mode,
-                find=orig, expected=orig,
+                coord=coord, new=repl, mode=rmode,
+                find=find, expected=orig,
                 label=label,
                 anchor_text=anchor_text, anchor_coord=anchor_coord,
             ))
@@ -666,9 +734,15 @@ class SpeziSmithApp:
         self._worker = threading.Thread(
             target=self._batch_worker,
             args=(files, rules, out_dir, self.suffix.get(), self.verify.get(),
-                  self.layout_check.get(), self._layout_ref),
+                  self.layout_check.get(), self._layout_ref_for(rules)),
             daemon=True)
         self._worker.start()
+
+    def _layout_ref_for(self, rules: list[Rule]) -> dict:
+        """Vorlagen-Fingerabdruck ohne die Zellen, die ohnehin geändert werden."""
+        changed = {r.coord for r in rules}
+        return {k: v for k, v in self._layout_ref.items()
+                if k.split("!", 1)[-1] not in changed or not k.startswith("0!")}
 
     def _batch_worker(self, files, rules, out_dir, suffix, verify,
                       layout_check, layout_ref):
@@ -681,10 +755,12 @@ class SpeziSmithApp:
                                  f"({LANG_LABELS.get(lang, lang)}) – übersprungen", ""))
             elif layout_check and layout_ref:
                 sim = layout_similarity(layout_ref, layout_fingerprints(src))
-                if sim < 0.75:
+                if sim < LAYOUT_MIN_SIMILARITY:
                     self._queue.put(("log", os.path.basename(src), "warn",
                                      f"Layout weicht ab (nur {sim:.0%} Übereinstimmung"
-                                     f" mit der Vorlage) – übersprungen", ""))
+                                     f" mit der Vorlage) – übersprungen. "
+                                     f"Tipp: Layout-Prüfung in Schritt 2 "
+                                     f"abschalten, falls die Datei passt.", ""))
                 else:
                     self._apply_one(src, out_dir, suffix, rules, verify, errors)
             else:
@@ -708,6 +784,7 @@ class SpeziSmithApp:
     def _process_with_dialogs(self, files: list[str], rules: list[Rule]):
         errors = []
         layout_check = self.layout_check.get()
+        layout_ref = self._layout_ref_for(rules)
         for i, src in enumerate(files, start=1):
             name = os.path.basename(src)
             lang = detect_language(src)
@@ -717,11 +794,14 @@ class SpeziSmithApp:
                           f"({LANG_LABELS.get(lang, lang)}) – übersprungen", "")
                 continue
             if layout_check and self._layout_ref:
-                sim = layout_similarity(self._layout_ref, layout_fingerprints(src))
-                if sim < 0.75:
+                sim = layout_similarity(layout_ref, layout_fingerprints(src))
+                if sim < LAYOUT_MIN_SIMILARITY and not messagebox.askyesno(
+                        APP_NAME,
+                        f"{name}\n\nLayout weicht ab (nur {sim:.0%} Übereinstimmung "
+                        f"mit der Vorlage).\n\nTrotzdem verarbeiten?",
+                        parent=self.root):
                     self._log(name, "warn",
-                              f"Layout weicht ab (nur {sim:.0%} Übereinstimmung "
-                              f"mit der Vorlage) – übersprungen", "")
+                              f"Layout weicht ab ({sim:.0%}) – übersprungen", "")
                     continue
             stem, ext = os.path.splitext(name)
             target = filedialog.asksaveasfilename(

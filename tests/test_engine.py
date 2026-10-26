@@ -318,7 +318,7 @@ def test_layout_similarity():
     ref = layout_fingerprints(TPL_DE)
     assert layout_similarity(ref, layout_fingerprints(TPL_DE)) == 1.0
     en = layout_fingerprints(TPL_EN)
-    assert layout_similarity(ref, en) < 0.75  # andere Sprache = anderes Layout
+    assert layout_similarity(ref, en) < 0.6  # andere Sprache = anderes Layout
 
 
 def test_verify_empty_expected_requires_empty_target(tmp_path):

@@ -58,7 +58,7 @@ def _px_width(excel_width: float, scale: float) -> int:
 
 
 def _px_height(points: float, scale: float) -> int:
-    return max(10, int(points * 96 / 72 * scale))
+    return max(3, int(points * 96 / 72 * scale))
 
 
 def _excel_color(color_obj, fallback: str) -> str:
@@ -82,6 +82,7 @@ class CellWidget:
                  justify: str, wrap: bool):
         self.sheet = sheet
         self.coord = coord
+        self.grid_row = grid_row
         self.row = row
         self.col = col
         self.orig_text = text
@@ -148,6 +149,13 @@ class SheetView(ttk.Frame):
         self._fonts: dict[tuple, tkfont.Font] = {}
         self._matches: list[str] = []
         self._match_idx = -1
+        self.fit = False
+        self.pages: list[list[int]] = [[]]
+        self.page = 0
+        self._row_items: dict[int, list] = {}
+        self._row_min: dict[int, tuple[int, int]] = {}
+        self._path: Optional[str] = None
+        self._fit_job = None
 
         self.columnconfigure(1, weight=1)
         self.rowconfigure(1, weight=1)
@@ -177,6 +185,22 @@ class SheetView(ttk.Frame):
                                        self.left_canvas.yview_moveto(a[0])),
         )
 
+        # Seitennavigation (unter der Seitenansicht)
+        self.nav = ttk.Frame(self)
+        self.nav.grid(row=3, column=0, columnspan=3, pady=(4, 0))
+        self.prev_btn = ttk.Button(self.nav, text="◀", width=3,
+                                   command=lambda: self.show_page(self.page - 1))
+        self.prev_btn.pack(side="left")
+        self.page_label = ttk.Label(self.nav, text="Seite 1 von 1",
+                                    font=("Segoe UI", 10, "bold"))
+        self.page_label.pack(side="left", padx=10)
+        self.next_btn = ttk.Button(self.nav, text="▶", width=3,
+                                   command=lambda: self.show_page(self.page + 1))
+        self.next_btn.pack(side="left")
+        self.jump_frame = ttk.Frame(self.nav)
+        self.jump_frame.pack(side="left", padx=(16, 0))
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+
         self.grid_frame = tk.Frame(self.canvas, background="white")
         self.top_frame = tk.Frame(self.top_canvas, background=HEADER_BG)
         self.left_frame = tk.Frame(self.left_canvas, background=HEADER_BG)
@@ -204,16 +228,78 @@ class SheetView(ttk.Frame):
         key = (bold, round(size * self.scale, 1), italic)
         if key not in self._fonts:
             self._fonts[key] = tkfont.Font(
-                family="Segoe UI", size=max(6, int(round(size * self.scale))),
+                family="Segoe UI", size=max(5, int(round(size * self.scale))),
                 weight="bold" if bold else "normal",
                 slant="italic" if italic else "roman")
         return self._fonts[key]
 
     def load_template(self, path: str, keep: Optional[dict] = None,
-                      scale: Optional[float] = None):
-        """Lädt eine Vorlage und baut die komplette Seite neu auf."""
-        if scale is not None:
+                      scale: Optional[float] = None, fit: bool = False,
+                      page: Optional[int] = None) -> int:
+        """Lädt eine Vorlage. fit=True: Maßstab so wählen, dass eine ganze
+        Seite ohne Scrollen in die Ansicht passt."""
+        self._path = path
+        self.fit = fit
+        if scale is not None and not fit:
             self.scale = scale
+        if page is not None:
+            self.page = page
+        count = self._build(path, keep)
+        if fit:
+            self._autofit(keep)
+        return count
+
+    def _fit_factor(self) -> Optional[float]:
+        """Faktor, um den der Maßstab geändert werden müsste (1.0 = passt exakt)."""
+        self.update_idletasks()
+        avail_w, avail_h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if avail_w < 100 or avail_h < 100:
+            return None
+        need_w = need_h = 1
+        current = self.page
+        for n in range(len(self.pages)):
+            self._apply_page(n)
+            self.grid_frame.update_idletasks()
+            need_w = max(need_w, self.grid_frame.winfo_reqwidth())
+            need_h = max(need_h, self.grid_frame.winfo_reqheight())
+        self._apply_page(current)
+        return min((avail_w - 4) / need_w, (avail_h - 4) / need_h)
+
+    def _autofit(self, keep: Optional[dict]):
+        for _ in range(10):
+            factor = self._fit_factor()
+            if factor is None or 1.0 <= factor <= 1.05:
+                break
+            # Feste Mindestgrößen machen die Höhe nicht linear: beim Verkleinern
+            # stärker nachregeln, beim Vergrößern vorsichtig herantasten.
+            step = factor ** 3 * 0.99 if factor < 1.0 else 1.0 + (factor - 1.0) * 0.5
+            new = max(0.3, min(1.5, self.scale * step))
+            if abs(new - self.scale) < 0.005:
+                break
+            self.scale = new
+            self._build(self._path, keep if keep is not None else self.changed())
+        self._apply_page(self.page)
+
+    def _on_canvas_resize(self, _event=None):
+        if not self.fit or not self._path:
+            return
+        if self._fit_job:
+            self.after_cancel(self._fit_job)
+        self._fit_job = self.after(250, self._refit)
+
+    def _refit(self):
+        self._fit_job = None
+        factor = self._fit_factor()
+        if factor is not None and not 1.0 <= factor <= 1.05:
+            keep = self.changed()
+            selected = self.selected
+            self._autofit(keep)
+            if selected in self.cells:
+                self.selected = selected
+                self.cells[selected]._refresh()
+
+    def _build(self, path: str, keep: Optional[dict] = None) -> int:
+        """Baut die komplette Seite neu auf."""
         for cell in self.cells.values():
             cell.frame.destroy()
         for w in self.top_frame.winfo_children() + self.left_frame.winfo_children():
@@ -221,6 +307,8 @@ class SheetView(ttk.Frame):
         for w in self.grid_frame.winfo_children():
             w.destroy()
         self.cells.clear()
+        self._row_items.clear()
+        self._row_min.clear()
         self.anchors.clear()
         self._tooltips.clear()
         self.selected = None
@@ -283,6 +371,16 @@ class SheetView(ttk.Frame):
             if bottom_parts:
                 plan.append(("hf_bottom", bottom_parts))
 
+            self.pages = [[]]
+            for idx, (kind, _payload) in enumerate(plan):
+                if kind == "sep":
+                    self.pages.append([])
+                else:
+                    self.pages[-1].append(idx)
+            if len(self.pages) > 1 and not self.pages[-1]:
+                self.pages.pop()
+            self.page = max(0, min(self.page, len(self.pages) - 1))
+
             grid_row_of: dict[int, int] = {}
             for idx, (kind, payload) in enumerate(plan):
                 if kind == "row":
@@ -309,11 +407,11 @@ class SheetView(ttk.Frame):
                 if kind == "row":
                     r = payload
                     self.grid_frame.grid_rowconfigure(idx, minsize=row_px[r])
-                    tk.Label(self.left_frame, text=str(r), background=HEADER_BG,
-                             foreground="#4A5568", font=self._font(True, 9),
-                             relief="solid", borderwidth=1,
-                             ).grid(row=idx, column=0, sticky="nsew")
-                    self.left_frame.grid_rowconfigure(idx, minsize=row_px[r] + 1)
+                    lbl = self._row_label(str(r), row_px[r], "#4A5568",
+                                          self._font(True, 9), idx)
+                    self.left_frame.grid_rowconfigure(idx, minsize=row_px[r])
+                    self._row_items.setdefault(idx, []).append(lbl)
+                    self._row_min[idx] = (row_px[r], row_px[r])
 
                 elif kind == "sep":
                     self.grid_frame.grid_rowconfigure(idx, minsize=8)
@@ -321,9 +419,10 @@ class SheetView(ttk.Frame):
                                     background="white")
                     sep.grid(row=idx, column=1, columnspan=max_col, sticky="ew")
                     sep.bind("<Configure>", lambda e, cv=sep: self._draw_sep(cv))
-                    tk.Label(self.left_frame, text="", background=HEADER_BG,
-                             ).grid(row=idx, column=0, sticky="nsew")
+                    lbl = self._row_label("", 8, "#4A5568", self._font(True, 9), idx)
                     self.left_frame.grid_rowconfigure(idx, minsize=8)
+                    self._row_items.setdefault(idx, []).extend([lbl, sep])
+                    self._row_min[idx] = (8, 8)
 
                 elif kind in ("hf_top", "hf_bottom"):
                     parts = payload
@@ -342,11 +441,15 @@ class SheetView(ttk.Frame):
                             1, c2 - c1 + 1, hf_font, HF_BG, "#333333",
                             anchor, justify, True)
                         self.cells[coord] = widget
+                        self._row_items.setdefault(idx, []).append(widget.frame)
+                        if coord in keep:
+                            widget.set_new_text(keep[coord])
                     label = "Kopf" if kind == "hf_top" else "Fuß"
-                    tk.Label(self.left_frame, text=label, background=HEADER_BG,
-                             foreground="#98A2B3", font=self._font(False, 7),
-                             ).grid(row=idx, column=0, sticky="nsew")
+                    lbl = self._row_label(label, h_px, "#98A2B3",
+                                          self._font(False, 7), idx)
                     self.left_frame.grid_rowconfigure(idx, minsize=h_px)
+                    self._row_items.setdefault(idx, []).append(lbl)
+                    self._row_min[idx] = (h_px, h_px)
 
             # Verbundene Zellen
             span: dict[str, tuple[int, int]] = {}
@@ -392,15 +495,73 @@ class SheetView(ttk.Frame):
                         rs, cs, self._font(bold, min(size, 16)),
                         bg, fg, anchor, justify, wrap)
                     self.cells[coord] = widget
+                    self._row_items.setdefault(widget.grid_row, []).append(widget.frame)
                     if coord in keep:
                         widget.set_new_text(keep[coord])
 
             self._compute_anchors()
-            self.grid_frame.update_idletasks()
-            self._update_scrollregions()
+            self._build_nav()
+            self._apply_page(self.page)
             return len(self.cells)
         finally:
             wb.close()
+
+    # -- Seiten -----------------------------------------------------------
+
+    def _build_nav(self):
+        for w in self.jump_frame.winfo_children():
+            w.destroy()
+        for n in range(len(self.pages)):
+            ttk.Button(self.jump_frame, text=f"Seite {n + 1}", width=8,
+                       command=lambda n=n: self.show_page(n)).pack(side="left", padx=2)
+
+    def page_of(self, coord: str) -> int:
+        cell = self.cells.get(coord)
+        if cell:
+            for n, rows in enumerate(self.pages):
+                if cell.grid_row in rows:
+                    return n
+        return 0
+
+    def show_page(self, n: int):
+        n = max(0, min(n, len(self.pages) - 1))
+        self._apply_page(n)
+
+    def _apply_page(self, n: int):
+        """Blendet alle Zeilen außer denen der Seite n aus."""
+        self.page = n
+        visible = set(self.pages[n])
+        for idx, items in self._row_items.items():
+            on = idx in visible
+            g_min, l_min = self._row_min.get(idx, (0, 0))
+            self.grid_frame.grid_rowconfigure(idx, minsize=g_min if on else 0)
+            self.left_frame.grid_rowconfigure(idx, minsize=l_min if on else 0)
+            for w in items:
+                if isinstance(w, tk.Canvas):
+                    w.grid_remove()  # Umbruchlinie: Seiten sind getrennt
+                elif on:
+                    w.grid()
+                else:
+                    w.grid_remove()
+        total = len(self.pages)
+        self.page_label.configure(text=f"Seite {n + 1} von {total}")
+        self.prev_btn.configure(state="normal" if n > 0 else "disabled")
+        self.next_btn.configure(state="normal" if n < total - 1 else "disabled")
+        self.grid_frame.update_idletasks()
+        self._update_scrollregions()
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
+
+    def _row_label(self, text: str, height: int, fg: str, font, idx: int):
+        """Zeilenkopf mit fester Höhe (wächst nicht mit der Schrift)."""
+        box = tk.Frame(self.left_frame, width=ROW_HEADER_W, height=height,
+                       background=HEADER_BG, highlightthickness=1,
+                       highlightbackground=GRID_COLOR)
+        box.pack_propagate(False)
+        tk.Label(box, text=text, background=HEADER_BG, foreground=fg,
+                 font=font, borderwidth=0).pack(fill="both", expand=True)
+        box.grid(row=idx, column=0, sticky="nsew")
+        return box
 
     def _draw_sep(self, canvas: tk.Canvas):
         canvas.delete("all")
@@ -494,6 +655,8 @@ class SheetView(ttk.Frame):
         self._match_idx = (self._match_idx + 1) % len(self._matches)
         coord = self._matches[self._match_idx]
         self.cells[coord].flash_match(True)
+        if self.page_of(coord) != self.page:
+            self.show_page(self.page_of(coord))
         self.scroll_to(coord)
         self.select(coord)
         return coord
@@ -502,6 +665,9 @@ class SheetView(ttk.Frame):
         cell = self.cells.get(coord)
         if not cell:
             return
+        if self.page_of(coord) != self.page:
+            self.show_page(self.page_of(coord))
+            self.update_idletasks()
         total_h = max(self.grid_frame.winfo_height(), 1)
         total_w = max(self.grid_frame.winfo_width(), 1)
         y = max(0.0, (cell.frame.winfo_y() - 60) / total_h)

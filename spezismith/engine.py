@@ -404,7 +404,9 @@ def _first_sheet_path(zf: zipfile.ZipFile) -> str:
     raise ValueError("Tabellen-Relationship nicht gefunden.")
 
 
-def _sheet_vml_paths(zf: zipfile.ZipFile, sheet_path: str) -> set[str]:
+def _sheet_related_paths(
+    zf: zipfile.ZipFile, sheet_path: str, relationship_type: str
+) -> set[str]:
     rels_path = posixpath.join(
         posixpath.dirname(sheet_path), "_rels",
         posixpath.basename(sheet_path) + ".rels")
@@ -414,7 +416,7 @@ def _sheet_vml_paths(zf: zipfile.ZipFile, sheet_path: str) -> set[str]:
         return set()
     paths = set()
     for rel in rels_root.findall(f"{{{PKG_REL_NS}}}Relationship"):
-        if not rel.get("Type", "").endswith("/vmlDrawing"):
+        if not rel.get("Type", "").endswith(f"/{relationship_type}"):
             continue
         target = rel.get("Target", "")
         if target.startswith("/"):
@@ -800,6 +802,22 @@ def _shift_vml_rows(xml_text: str, shifts: list[tuple[int, int]]) -> str:
                 + match.group(5))
 
     return row_re.sub(shift_row_tag, xml_text)
+
+
+def _shift_drawing_rows(xml_text: str, shifts: list[tuple[int, int]]) -> str:
+    """Verschiebt DrawingML-Anker fuer Checkboxen und andere Objekte."""
+    row_re = re.compile(
+        r"(<(?:[\w.-]+:)?row\b[^>]*>)(\s*)(-?\d+)(\s*)(</(?:[\w.-]+:)?row\s*>)")
+
+    def shift_row(match: re.Match) -> str:
+        row = int(match.group(3))
+        for at, delta in shifts:
+            if row >= at - 1:
+                row += delta
+        return (match.group(1) + match.group(2) + str(row) + match.group(4)
+                + match.group(5))
+
+    return row_re.sub(shift_row, xml_text)
 
 
 def _merge_bottom(root: ET.Element, coord: str) -> int:
@@ -1262,7 +1280,10 @@ def apply_to_file(
 
             os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
             tmp_target = target + ".tmp"
-            vml_paths = _sheet_vml_paths(zin, sheet_path) if shifts else set()
+            vml_paths = (_sheet_related_paths(zin, sheet_path, "vmlDrawing")
+                         if shifts else set())
+            drawing_paths = (_sheet_related_paths(zin, sheet_path, "drawing")
+                             if shifts else set())
             with zipfile.ZipFile(tmp_target, "w", zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
                     if item.filename == sheet_path:
@@ -1276,6 +1297,10 @@ def apply_to_file(
                         vml_xml = zin.read(item.filename).decode("utf-8")
                         vml_xml = _shift_vml_rows(vml_xml, shifts)
                         zout.writestr(item, vml_xml.encode("utf-8"))
+                    elif item.filename in drawing_paths:
+                        drawing_xml = zin.read(item.filename).decode("utf-8")
+                        drawing_xml = _shift_drawing_rows(drawing_xml, shifts)
+                        zout.writestr(item, drawing_xml.encode("utf-8"))
                     else:
                         zout.writestr(item, zin.read(item.filename))
             shutil.move(tmp_target, target)

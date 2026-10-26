@@ -490,6 +490,9 @@ def test_structure_sync_replaces_and_inserts_rows(tmp_path):
         source_vml = ET.fromstring(
             source_zip.read("xl/drawings/vmlDrawing1.vml"))
         out_vml = ET.fromstring(out_zip.read("xl/drawings/vmlDrawing1.vml"))
+        source_drawing = ET.fromstring(
+            source_zip.read("xl/drawings/drawing1.xml"))
+        out_drawing = ET.fromstring(out_zip.read("xl/drawings/drawing1.xml"))
 
         def anchor_rows(root):
             return [
@@ -500,6 +503,22 @@ def test_structure_sync_replaces_and_inserts_rows(tmp_path):
 
         assert anchor_rows(out_vml) == [
             row + 1 for row in anchor_rows(source_vml)]
+
+        def drawing_anchor_rows(root):
+            rows = []
+            for anchor in root.iter():
+                if not anchor.tag.endswith("twoCellAnchor"):
+                    continue
+                for endpoint in anchor:
+                    if endpoint.tag.endswith(("from", "to")):
+                        row = next(
+                            child for child in endpoint
+                            if child.tag.endswith("row"))
+                        rows.append(int(row.text))
+            return rows
+
+        assert drawing_anchor_rows(out_drawing) == [
+            row + 1 for row in drawing_anchor_rows(source_drawing)]
 
 
 def test_structure_sync_keeps_product_values(tmp_path):

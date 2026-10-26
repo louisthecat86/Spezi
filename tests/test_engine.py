@@ -371,3 +371,57 @@ def test_header_footer_missing_part(tmp_path):
     res = apply_to_file(TPL_DE, str(out), [rule])
     assert res.ok
     assert res.cells[0].status == "uebersprungen"
+
+
+# ---------------------------------------------------------------------------
+# Spezifikation gegen hochgeladene Vorlage angleichen (fehlende Felder)
+# ---------------------------------------------------------------------------
+
+def _mini_spec(path, rows, merge=None):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for r, (a, b) in enumerate(rows, start=1):
+        ws.cell(r, 1, a)
+        if b is not None:
+            ws.cell(r, 2, b)
+    for ref in merge or []:
+        ws.merge_cells(ref)
+    wb.save(path)
+
+
+def test_missing_field_is_inserted_without_cell_jumps(tmp_path):
+    spec = tmp_path / "spec.xlsx"
+    _mini_spec(spec, [("Titel", None), ("Artikel:", "4711"), ("Ende", None)],
+               merge=["B3:C3"])
+    out = tmp_path / "out.xlsx"
+    rules = [
+        Rule(coord="B2", new="003", expected="003", label="Revision",
+             anchor_text="Revision:", anchor_coord="A2",
+             context_above=["Titel"], allow_insert=True),
+        Rule(coord="B3", new="Neu", expected="4711", label="Artikel",
+             anchor_text="Artikel:", anchor_coord="A3",
+             context_above=["Revision:", "Titel"], allow_insert=True),
+    ]
+    res = apply_to_file(str(spec), str(out), rules)
+    assert res.ok, res.error
+    ws = openpyxl.load_workbook(out).active
+    assert [ws.cell(r, 1).value for r in range(1, 5)] == [
+        "Titel", "Revision:", "Artikel:", "Ende"]
+    assert ws["B2"].value == "003"
+    assert ws["B3"].value == "Neu"          # nicht in die falsche Zeile gesprungen
+    assert [r.coord for r in ws.merged_cells.ranges] == ["B4:C4"]
+    assert any("eingefügt" in c.message for c in res.cells)
+
+
+def test_missing_field_without_position_is_skipped(tmp_path):
+    spec = tmp_path / "spec.xlsx"
+    _mini_spec(spec, [("Titel", None), ("Artikel:", "4711")])
+    out = tmp_path / "out.xlsx"
+    rule = Rule(coord="B2", new="003", expected="003",
+                anchor_text="Revision:", anchor_coord="A2",
+                context_above=["Gibt es nicht"], allow_insert=True)
+    res = apply_to_file(str(spec), str(out), [rule])
+    assert res.ok
+    assert res.cells[0].status == "uebersprungen"
+    ws = openpyxl.load_workbook(out).active
+    assert ws["B2"].value == "4711"

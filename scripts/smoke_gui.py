@@ -33,6 +33,20 @@ def main():
     app = SpeziSmithApp()
     pump(app, 1.0)
 
+    # 0) Start ohne Vorlage: Platzhalter sichtbar, Spezis werden abgelehnt
+    assert app.template_path is None
+    assert app.placeholder.winfo_ismapped()
+    shown = []
+    orig_warn = gui_module.messagebox.showwarning
+    gui_module.messagebox.showwarning = lambda *a, **k: shown.append(a)
+    app._handle_files([os.path.join(ROOT, "templates", "vorlage_de.xlsx")])
+    gui_module.messagebox.showwarning = orig_warn
+    assert shown, "Ohne Vorlage muss eine Warnung erscheinen"
+    assert app.set_template(os.path.join(ROOT, "templates", "vorlage_de.xlsx"))
+    pump(app, 1.0)
+    assert not app.placeholder.winfo_ismapped()
+    print("OK: Start ohne Vorlage, Upload blendet Platzhalter aus")
+
     # 1) Vorlagen-Ansicht wurde aufgebaut
     assert len(app.sheet.cells) > 100, f"zu wenige Zellen: {len(app.sheet.cells)}"
     print(f"OK: {len(app.sheet.cells)} klickbare Zellen im Raster (DE)")
@@ -137,6 +151,7 @@ def main():
     wb.active["A1"] = "Ganz andere Datei ohne Spezi-Layout"
     wb.save(fremd)
     wb.close()
+    app.layout_check.set(True)
     app._handle_files([fremd])
     for _ in range(200):
         pump(app, 0.05)
@@ -147,25 +162,30 @@ def main():
     assert "Layout" in last[1], last
     print("OK: Layout-Prüfung greift:", last[1][:60])
 
-    # 5) Sprachwechsel auf Englisch (Aenderung auf A1 bleibt erhalten)
-    app.lang_var.set("English")
-    app._on_language_change()
+    # 5) Neu laden (Zoom) behaelt die Aenderung auf A1
+    app._on_zoom_change()
     pump(app, 1.0)
     assert app.sheet.cells["A1"].new_text == "SmokeTest GmbH"
-    assert app.sheet.cells["A1"].changed
-    assert "Product" in app.sheet.cells["A3"].orig_text
     assert "HF:oddHeader.L" in app.sheet.cells
-    print(f"OK: Sprachwechsel nach EN ({len(app.sheet.cells)} Zellen), "
-          f"Aenderung auf A1 erhalten")
+    print("OK: Neuaufbau, Aenderung auf A1 erhalten")
+
+    # 5a) Feld uebernehmen (Vorlagenwert in alle Spezis)
+    app.sheet.select("A5")
+    app.adopt_var.set(True)
+    app._on_adopt_toggled()
+    assert app.sheet.cells["A5"].new_text == app.sheet.orig_value("A5")
+    r5 = next(r for r in app._collect_rules() if r.coord == "A5")
+    assert r5.allow_insert and r5.context_above
+    app.adopt_var.set(False)
+    app._on_adopt_toggled()
+    assert app.sheet.cells["A5"].new_text is None
+    print("OK: Feld uebernehmen erzeugt Regel mit Einfuegekontext")
 
     # 5b) Zoom aendern (ganze Seite kleiner)
-    app.lang_var.set("Deutsch")
-    app._on_language_change()
-    pump(app, 0.8)
     app.zoom_var.set("70 %")
     app._on_zoom_change()
     pump(app, 0.8)
-    assert app.sheet.scale == 0.7
+    assert app.sheet.scale == 0.7, (app.sheet.scale, app.status_var.get(), app.zoom_var.get())
     assert len(app.sheet.cells) > 100
     print("OK: Zoom 70 % aufgebaut")
     app.zoom_var.set("100 %")

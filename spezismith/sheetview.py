@@ -307,7 +307,7 @@ class SheetView(ttk.Frame):
 
     def _refit(self):
         self._fit_job = None
-        if self._set_fit_scale():
+        if self.fit and self._set_fit_scale():
             keep = self.changed()
             selected = self.selected
             self._build(self._path, keep)

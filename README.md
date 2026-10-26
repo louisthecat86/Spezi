@@ -8,18 +8,24 @@ anpassen** – als portable Windows-EXE, die ohne Installation überall läuft
 
 ## Was macht das Tool?
 
-1. **Die Spezifikation als ganze Seite sehen:** SpeziSmith zeigt die Vorlage
-   **maßstabsgetreu wie im Ausdruck** an (Deutsch *oder* Englisch – wählbar oben
-   rechts): beide Teile (Produkt- *und* Verpackungsspezifizierung),
+1. **Vorlage hochladen:** SpeziSmith startet ohne Vorlage. Über **„Vorlage
+   hochladen“** (Button oder Drag & Drop) lädt man eine einmal korrekt gebaute
+   Spezifikation (z. B. mit Revision 003) hoch; das Tool analysiert alle Felder
+   samt Beschriftung. Beliebige Sprache/Variante – es gibt keine feste Vorlage.
+2. **Die Vorlage als ganze Seite sehen:** SpeziSmith zeigt sie
+   **maßstabsgetreu wie im Ausdruck** an: beide Teile (Produkt- *und* Verpackungsspezifizierung),
    **Kopf- und Fußzeile** (z. B. „FB_QM_005 · Seite &P von &N“, Datum/Revisionsnummer),
    Seitenumbruch-Linien, Spaltenbreiten, Zeilenhöhen, verbundene Zellen und Farben.
    Man klickt **einfach genau das Feld an**, das man ändern will, und trägt unten
-   den neuen Wert ein – die Änderung wird sofort farblich hervorgehoben direkt
+   den neuen Wert ein – oder wählt **„Vorlagenwert in alle Spezifikationen
+   übernehmen“** (z. B. für die Revisionsnummer). Die Änderung wird sofort farblich hervorgehoben direkt
    im Seitenlayout sichtbar (WYSIWYG). Mit dem **Zoom-Regler** (60–150 %) passt
    die ganze Seite auf den Bildschirm.
-2. **Spezis hereinziehen:** Eine oder **mehrere Spezifikationen gleichzeitig**
+3. **Spezis hereinziehen:** Eine oder **mehrere Spezifikationen gleichzeitig**
    (z. B. 5 markierte Dateien) in die Drag-&-Drop-Zone ziehen. Alle geänderten
-   Felder werden ersetzt; das Ergebnis landet wahlweise
+   Felder werden gegen die Vorlage ersetzt. **Fehlt ein Feld in der Spezi**,
+   wird es an der passenden Stelle (anhand der Zeilen darüber) als neue Zeile
+   eingefügt – so gibt es keine „Feldsprünge“. Das Ergebnis landet wahlweise
    - in einem **Zielordner** (Pfad eingeben/durchsuchen) oder
    - per **„Speichern unter“-Dialog** („Download“-Gefühl) für jede Datei.
 
@@ -29,8 +35,6 @@ XML-Ebene, kein verlustbehafteter Excel-Roundtrip).
 
 ## Weitere Features
 
-- 🌍 **Sprachauswahl** Deutsch/English; abgelegte Dateien mit der „falschen“
-  Sprache werden erkannt und übersprungen (Warnung im Log)
 - 🧭 **Verschiebungstolerante Ersetzung:** Zellen werden über ihren **Inhalt**
   bzw. über die **Beschriftung neben dem Feld** gefunden – funktioniert auch,
   wenn eine Spezifikation mehr Zutaten-Zeilen hat als die Vorlage und sich
@@ -78,7 +82,7 @@ kopieren kann.
 
 | Schritt | Aktion |
 |---|---|
-| 1 | Sprache wählen → **Feld in der Vorlage anklicken** → neuen Wert eintragen (Suche hilft beim Finden) |
+| 1 | **Vorlage hochladen** → Feld anklicken → „in alle Spezifikationen übernehmen“ oder neuen Wert eintragen (Suche hilft beim Finden) |
 | 2 | Zielordner angeben *oder* „Nach jeder Datei fragen“; Dateinamen-Zusatz (Standard `_angepasst`); optional Verifikation/Teiltext-Modus |
 | 3 | `.xlsx`-Dateien in die Drop-Zone ziehen (Mehrfachauswahl!) oder über die Schaltfläche auswählen |
 

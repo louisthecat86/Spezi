@@ -2,7 +2,7 @@
 SpeziSmith - Grafische Oberfläche
 
 Modernes UI (Sun-Valley-Theme) mit:
-- Sprachauswahl Deutsch/English (steuert die analysierte Vorlage)
+- Vorlage hochladen (beliebige korrekte Spezifikation) statt fester Vorlage
 - maßstabsgetreuer, klickbarer Vorlagen-Ansicht (WYSIWYG): Feld anklicken,
   Änderung eintragen, Ergebnis direkt im Layout sehen
 - Drag & Drop für beliebig viele Spezifikationen gleichzeitig
@@ -33,16 +33,16 @@ from .engine import (
     HF_PREFIX,
     Rule,
     apply_to_file,
-    detect_language,
+    context_above,
+    split_coord,
     layout_fingerprints,
     layout_similarity,
+    template_row_texts,
     LAYOUT_MIN_SIMILARITY,
     unique_target_path,
 )
 from .resources import (
     LOGO_PNG,
-    TEMPLATE_DE,
-    TEMPLATE_EN,
     load_config,
     resource_path,
     save_config,
@@ -51,10 +51,6 @@ from .sheetview import SheetView, hf_friendly_name
 
 NAVY = "#1F2942"
 ORANGE = "#F08C21"
-
-LANG_DE = "de"
-LANG_EN = "en"
-LANG_LABELS = {LANG_DE: "Deutsch", LANG_EN: "English"}
 
 FILE_TYPES = [("Excel-Spezifikation", "*.xlsx *.xlsm")]
 
@@ -139,9 +135,8 @@ class ToolTip:
 class SpeziSmithApp:
     def __init__(self):
         self.cfg = load_config()
-        self.lang = self.cfg.get("language", LANG_DE)
-        if self.lang not in LANG_LABELS:
-            self.lang = LANG_DE
+        self.template_path: str | None = None
+        self._row_texts: dict[int, str] = {}
 
         self.dnd_ok = False
         if DND_AVAILABLE:
@@ -153,7 +148,7 @@ class SpeziSmithApp:
                 self.root = tk.Tk()
         else:
             self.root = tk.Tk()
-        self.root.title(f"{APP_NAME} {__version__} – Spezifikationen anpassen")
+        self.root.title(f"{APP_NAME} {__version__} – Spezifikationen an Vorlage angleichen")
         self.root.geometry("1400x860")
         self.root.minsize(1100, 680)
 
@@ -170,13 +165,14 @@ class SpeziSmithApp:
         self.out_dir = tk.StringVar(value=self.cfg.get("out_dir", ""))
         self.suffix = tk.StringVar(value=self.cfg.get("suffix", "_angepasst"))
         self.verify = tk.BooleanVar(value=self.cfg.get("verify", False))
-        self.layout_check = tk.BooleanVar(value=self.cfg.get("layout_check", True))
+        self.layout_check = tk.BooleanVar(value=self.cfg.get("layout_check", False))
         self.replace_mode = tk.StringVar(value=self.cfg.get("replace_mode", "set"))
         self.zoom_var = tk.StringVar(value=self.cfg.get("zoom", "Ganze Seite"))
         self.status_var = tk.StringVar(value="Bereit.")
         self.progress_var = tk.DoubleVar(value=0)
         self.counter_var = tk.StringVar(value="Keine Änderungen")
-        self.lang_var = tk.StringVar(value=LANG_LABELS[self.lang])
+        self.template_var = tk.StringVar(value="Keine Vorlage geladen")
+        self.adopt_var = tk.BooleanVar(value=False)
         self._layout_ref: dict = {}
         self._progress_started_at: float | None = None
         self._progress_total = 0
@@ -198,7 +194,7 @@ class SpeziSmithApp:
         self._last_out_dir: str = ""
 
         self._build_ui()
-        self._load_template(preserve={})
+        self._show_placeholder(True)
         self._poll_queue()
 
     # ------------------------------------------------------------------
@@ -246,17 +242,15 @@ class SpeziSmithApp:
         ttk.Label(header, text=APP_NAME,
                   font=("Segoe UI", 20, "bold")).grid(row=0, column=1, sticky="w")
         ttk.Label(header,
-                  text="Feld in der Vorlage anklicken · Änderung eintragen · "
-                       "Spezifikationen hereinziehen – fertig.",
+                  text="Vorlage hochladen · Felder markieren · "
+                       "Spezifikationen hereinziehen – alle werden auf die Vorlage angeglichen.",
                   foreground="#666666").grid(row=1, column=1, sticky="w")
 
-        ttk.Label(header, text="Sprache der Vorlage:").grid(row=0, column=2,
-                                                            sticky="e", padx=(10, 4))
-        lang_box = ttk.Combobox(header, textvariable=self.lang_var, width=10,
-                                state="readonly",
-                                values=list(LANG_LABELS.values()))
-        lang_box.grid(row=0, column=3, sticky="e")
-        lang_box.bind("<<ComboboxSelected>>", self._on_language_change)
+        ttk.Label(header, textvariable=self.template_var,
+                  foreground="#666666").grid(row=0, column=2, sticky="e",
+                                             padx=(10, 6))
+        ttk.Button(header, text="📂 Vorlage hochladen…", style="Accent.TButton",
+                   command=self._pick_template).grid(row=0, column=3, sticky="e")
 
         self.theme_btn = ttk.Button(header, text="🌙 Dunkel", width=11,
                                     command=self._toggle_theme)
@@ -270,7 +264,7 @@ class SpeziSmithApp:
 
     def _build_step1(self, main):
         frame = ttk.LabelFrame(
-            main, text=" 1 · Feld anklicken und Änderung eintragen ", padding=6)
+            main, text=" 1 · Vorlage: Felder anklicken, die in alle Spezifikationen gelten sollen ", padding=6)
         frame.grid(row=0, column=0, sticky="nsew", pady=(2, 6))
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
@@ -309,6 +303,24 @@ class SpeziSmithApp:
         self.sheet = SheetView(frame, on_select=self._on_cell_select)
         self.sheet.grid(row=1, column=0, sticky="nsew")
 
+        self.placeholder = tk.Frame(frame, highlightthickness=0)
+        ttk.Label(self.placeholder,
+                  text="Noch keine Vorlage geladen",
+                  font=("Segoe UI", 16, "bold")).pack(pady=(0, 6))
+        ttk.Label(self.placeholder,
+                  text="Lade zuerst eine korrekte Spezifikation als Vorlage hoch.\n"
+                       "SpeziSmith liest alle Felder samt Beschriftung ein; danach "
+                       "werden alle hereingezogenen Spezifikationen\n"
+                       "auf diese Vorlage angeglichen (fehlende Felder werden "
+                       "eingefügt, gewählte Werte übernommen).",
+                  justify="center", foreground="#666666").pack(pady=(0, 12))
+        ttk.Button(self.placeholder, text="📂  Vorlage hochladen…",
+                   style="Accent.TButton",
+                   command=self._pick_template).pack()
+        if self.dnd_ok:
+            self.placeholder.drop_target_register(DND_FILES)
+            self.placeholder.dnd_bind("<<Drop>>", self._on_template_drop)
+
         # Bearbeitungsleiste
         edit = ttk.Frame(frame, padding=(2, 6, 2, 0))
         edit.grid(row=2, column=0, sticky="ew")
@@ -336,7 +348,17 @@ class SpeziSmithApp:
         ttk.Button(edit, text="Zurücknehmen", width=13,
                    command=self._revert_current).grid(row=1, column=5, sticky="n", padx=(6, 0), pady=(4, 0))
 
-        self._edit_widgets = (self.new_entry, self.clear_cb)
+        self.adopt_cb = ttk.Checkbutton(
+            edit, text="Vorlagenwert in alle Spezifikationen übernehmen",
+            variable=self.adopt_var, command=self._on_adopt_toggled)
+        self.adopt_cb.grid(row=2, column=1, columnspan=5, sticky="w",
+                           padx=(4, 0), pady=(4, 0))
+        ToolTip(self.adopt_cb,
+                "Der aktuelle Feldwert der Vorlage (z. B. Revision 003) wird in "
+                "jeder hereingezogenen Spezifikation gesetzt. Fehlt das Feld "
+                "dort noch, wird es an der passenden Stelle eingefügt.")
+
+        self._edit_widgets = (self.new_entry, self.clear_cb, self.adopt_cb)
         self._set_edit_enabled(False)
 
     def _set_edit_enabled(self, enabled: bool):
@@ -365,6 +387,7 @@ class SpeziSmithApp:
         self._edit_guard = True
         self.sel_new_var.set(orig if cell.new_text is None else cell.new_text)
         self.sel_clear_var.set(cell.new_text == "")
+        self.adopt_var.set(cell.new_text is not None and cell.new_text == orig)
         self._edit_guard = False
         self._set_edit_enabled(True)
         if cell.new_text == "":
@@ -382,8 +405,26 @@ class SpeziSmithApp:
         if not coord or self.sel_clear_var.get():
             return
         text = self.sel_new_var.get()
-        unchanged = not text or text == self.sheet.orig_value(coord)
+        same = text == self.sheet.orig_value(coord)
+        keep = same and self.adopt_var.get()
+        unchanged = not text or (same and not keep)
         self.sheet.set_new_value(coord, None if unchanged else text)
+        self._refresh_counter()
+
+    def _on_adopt_toggled(self):
+        coord = self._current_coord()
+        if not coord:
+            return
+        orig = self.sheet.orig_value(coord)
+        if self.adopt_var.get():
+            self._edit_guard = True
+            self.sel_clear_var.set(False)
+            self.sel_new_var.set(orig)
+            self._edit_guard = False
+            self.new_entry.configure(state="normal")
+            self.sheet.set_new_value(coord, orig)
+        else:
+            self.sheet.set_new_value(coord, None)
         self._refresh_counter()
 
     def _on_clear_toggled(self):
@@ -392,6 +433,7 @@ class SpeziSmithApp:
             return
         if self.sel_clear_var.get():
             self._edit_guard = True
+            self.adopt_var.set(False)
             self.sel_new_var.set("")
             self._edit_guard = False
             self.new_entry.configure(state="disabled")
@@ -411,6 +453,7 @@ class SpeziSmithApp:
         self._edit_guard = True
         self.sel_new_var.set(self.sheet.orig_value(coord))
         self.sel_clear_var.set(False)
+        self.adopt_var.set(False)
         self._edit_guard = False
         self.new_entry.configure(state="normal")
         self.sheet.set_new_value(coord, None)
@@ -421,6 +464,7 @@ class SpeziSmithApp:
         self._edit_guard = True
         self.sel_new_var.set(self.sheet.orig_value(self._selected_coord or ""))
         self.sel_clear_var.set(False)
+        self.adopt_var.set(False)
         self._edit_guard = False
         self.new_entry.configure(state="normal")
         self._refresh_counter()
@@ -609,9 +653,36 @@ class SpeziSmithApp:
     # Vorlage / Sprache
     # ------------------------------------------------------------------
 
-    def _template_path(self) -> str:
-        rel = TEMPLATE_DE if self.lang == LANG_DE else TEMPLATE_EN
-        return resource_path(rel)
+    def _show_placeholder(self, show: bool):
+        if show:
+            self.placeholder.grid(row=1, column=0, sticky="nsew")
+            self.placeholder.lift()
+        else:
+            self.placeholder.grid_remove()
+        self._set_edit_enabled(False)
+
+    def _pick_template(self):
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Vorlage auswählen (korrekte Spezifikation)",
+            filetypes=FILE_TYPES)
+        if path:
+            self.set_template(path)
+
+    def _on_template_drop(self, event):
+        paths = [p for p in self.root.tk.splitlist(event.data)
+                 if p.lower().endswith((".xlsx", ".xlsm"))]
+        if paths:
+            self.set_template(paths[0])
+
+    def set_template(self, path: str) -> bool:
+        """Lädt eine neue Vorlage; bisherige Markierungen werden verworfen."""
+        previous = self.template_path
+        self.template_path = path
+        if not self._load_template(preserve={}):
+            self.template_path = previous
+            return False
+        self._save_cfg()
+        return True
 
     def _zoom_fit(self) -> bool:
         return not self.zoom_var.get().strip().endswith("%")
@@ -626,31 +697,32 @@ class SpeziSmithApp:
         self._load_template(preserve=self.sheet.changed())
         self._save_cfg()
 
-    def _load_template(self, preserve: dict):
+    def _load_template(self, preserve: dict) -> bool:
+        if not self.template_path:
+            return False
         self.status_var.set("Analysiere Vorlage…")
         self.root.update_idletasks()
         try:
-            count = self.sheet.load_template(self._template_path(), keep=preserve,
+            count = self.sheet.load_template(self.template_path, keep=preserve,
                                              scale=self._zoom_scale(),
                                              fit=self._zoom_fit(),
                                              page=self.sheet.page)
-            self._layout_ref = layout_fingerprints(self._template_path())
+            self._layout_ref = layout_fingerprints(self.template_path)
+            self._row_texts = template_row_texts(self.template_path)
         except Exception as exc:
             messagebox.showerror(APP_NAME,
                                  f"Vorlage konnte nicht gelesen werden:\n{exc}")
-            count = 0
+            self.status_var.set("Vorlage konnte nicht gelesen werden.")
+            return False
+        self._show_placeholder(False)
+        self.template_var.set(os.path.basename(self.template_path))
         self._refresh_counter()
         self.search_info_var.set("")
         self.search_var.set("")
         self.status_var.set(
-            f"Vorlage ({LANG_LABELS[self.lang]}): {count} Felder – "
-            f"bitte ein Feld anklicken.")
-
-    def _on_language_change(self, _event=None):
-        label = self.lang_var.get()
-        self.lang = LANG_DE if label == LANG_LABELS[LANG_DE] else LANG_EN
-        self._load_template(preserve=self.sheet.changed())
-        self._save_cfg()
+            f"Vorlage: {count} Felder erkannt – bitte Felder anklicken, "
+            f"die in alle Spezifikationen übernommen werden sollen.")
+        return True
 
     def _collect_rules(self) -> list[Rule]:
         rules = []
@@ -668,11 +740,15 @@ class SpeziSmithApp:
                 part = _changed_lines(orig, new)
                 if part:
                     find, repl, rmode = part[0], part[1], "replace"
+            is_hf = coord.startswith(HF_PREFIX)
             rules.append(Rule(
                 coord=coord, new=repl, mode=rmode,
                 find=find, expected=orig,
                 label=label,
                 anchor_text=anchor_text, anchor_coord=anchor_coord,
+                context_above=([] if is_hf else context_above(
+                    self._row_texts, split_coord(coord)[1])),
+                allow_insert=not is_hf,
             ))
         return rules
 
@@ -703,12 +779,19 @@ class SpeziSmithApp:
             self.status_var.set("Keine Excel-Dateien dabei (.xlsx/.xlsm).")
             return
 
+        if not self.template_path:
+            messagebox.showwarning(
+                APP_NAME, "Bitte zuerst oben eine Vorlage hochladen.")
+            self.status_var.set("Keine Vorlage geladen – nichts zu tun.")
+            return
+
         rules = self._collect_rules()
         if not rules:
             messagebox.showwarning(
                 APP_NAME,
                 "Bitte zuerst in Schritt 1 mindestens ein Feld anklicken\n"
-                "und einen neuen Wert eintragen.")
+                "und „in alle Spezifikationen übernehmen“ wählen\n"
+                "(oder einen neuen Wert eintragen).")
             self.status_var.set("Keine Felder geändert – nichts zu tun.")
             return
 
@@ -758,12 +841,7 @@ class SpeziSmithApp:
             name = os.path.basename(src)
             self._queue.put(("file_start", i, name))
             try:
-                lang = detect_language(src)
-                if lang and lang != self.lang:
-                    self._queue.put(("log", name, "warn",
-                                     f"Sprache passt nicht zur Auswahl "
-                                     f"({LANG_LABELS.get(lang, lang)}) – übersprungen", ""))
-                elif layout_check and layout_ref:
+                if layout_check and layout_ref:
                     sim = layout_similarity(layout_ref, layout_fingerprints(src))
                     if sim < LAYOUT_MIN_SIMILARITY:
                         self._queue.put(("log", name, "warn",
@@ -809,19 +887,6 @@ class SpeziSmithApp:
         for i, src in enumerate(files, start=1):
             name = os.path.basename(src)
             self._progress_current = name
-            try:
-                lang = self._run_dialog_step(lambda: detect_language(src))
-            except Exception as exc:
-                errors.append(f"{name}: {exc}")
-                self._log(name, "err", f"Fehler: {exc}", "")
-                self._mark_progress_done(i)
-                continue
-            if lang and lang != self.lang:
-                self._log(name, "warn",
-                          f"Sprache passt nicht zur Auswahl "
-                          f"({LANG_LABELS.get(lang, lang)}) – übersprungen", "")
-                self._mark_progress_done(i)
-                continue
             if layout_check and self._layout_ref:
                 try:
                     sim = self._run_dialog_step(
@@ -1039,7 +1104,6 @@ class SpeziSmithApp:
 
     def _save_cfg(self):
         save_config({
-            "language": self.lang,
             "theme": sv_ttk.get_theme(),
             "out_mode": self.out_mode.get(),
             "out_dir": self.out_dir.get(),

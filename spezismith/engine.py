@@ -102,6 +102,8 @@ class Rule:
     label: str = ""
     anchor_text: str = ""      # Beschriftung neben/ueber dem Feld (Verschiebungs-Anker)
     anchor_coord: str = ""     # Koordinate der Beschriftung in der Vorlage
+    context_above: list = field(default_factory=list)  # Texte darueber (nah -> fern)
+    allow_insert: bool = False  # fehlendes Feld als neue Zeile einfuegen
 
 
 # Kopf-/Fußzeilen werden als Pseudo-Koordinaten adressiert: "HF:oddFooter.R"
@@ -173,6 +175,32 @@ def detect_language(path: str) -> Optional[str]:
     }
     best = max(scores, key=scores.get)
     return best if scores[best] > 0 else None
+
+
+def template_row_texts(path: str) -> dict[int, str]:
+    """Erster Text je Zeile der Vorlage (Zeile -> Text); Grundlage der Einfuegeposition."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        rows: dict[int, str] = {}
+        for row in wb.worksheets[0].iter_rows():
+            for cell in row:
+                if cell.value is not None and norm_text(cell.value):
+                    rows[cell.row] = norm_text(cell.value)
+                    break
+        return rows
+    finally:
+        wb.close()
+
+
+def context_above(rows: dict[int, str], row: int, limit: int = 6) -> list[str]:
+    """Texte der Zeilen oberhalb von `row` (nah -> fern, ohne Doppelte)."""
+    out: list[str] = []
+    for r in sorted((r for r in rows if r < row), reverse=True):
+        if rows[r] not in out:
+            out.append(rows[r])
+        if len(out) >= limit:
+            break
+    return out
 
 
 def analyze_template(path: str, include_empty_inputs: bool = True) -> list[Field]:
@@ -641,7 +669,9 @@ def _apply_hf_rule(root: ET.Element, rule: Rule, verify: bool,
 
 
 def _looks_numeric(text: str) -> bool:
-    return bool(_NUM_RE.match(text.strip()))
+    text = text.strip()
+    # fuehrende Nullen (z. B. Revision "003") muessen als Text erhalten bleiben
+    return bool(_NUM_RE.match(text)) and not re.match(r"^-?0\d", text)
 
 
 def _set_cell_value(cell: ET.Element, new_text: str) -> None:
@@ -700,6 +730,141 @@ def _find_or_create_cell(sheet_data: ET.Element, coord: str) -> ET.Element:
     return new_cell
 
 
+_REF_RE = re.compile(r"(\$?[A-Z]{1,3}\$?)(\d+)")
+
+
+def _shift_rows_in_ref(ref: str, at: int) -> str:
+    """Verschiebt alle Zeilennummern >= `at` in einem Bezug/Bereich um 1."""
+    return _REF_RE.sub(
+        lambda m: f"{m.group(1)}{int(m.group(2)) + (1 if int(m.group(2)) >= at else 0)}",
+        ref)
+
+
+def _merge_bottom(root: ET.Element, coord: str) -> int:
+    """Letzte Zeile des verbundenen Bereichs, der `coord` enthaelt (sonst die eigene)."""
+    col_s, row = split_coord(coord)
+    col = col_to_idx(col_s)
+    bottom = row
+    mc = root.find(f"{{{MAIN_NS}}}mergeCells")
+    for m in (mc.findall(f"{{{MAIN_NS}}}mergeCell") if mc is not None else []):
+        ref = m.get("ref", "")
+        if ":" not in ref:
+            continue
+        (c1, r1), (c2, r2) = (split_coord(x) for x in ref.split(":"))
+        if r1 <= row <= r2 and col_to_idx(c1) <= col <= col_to_idx(c2):
+            bottom = max(bottom, r2)
+    return bottom
+
+
+def _insert_row(root: ET.Element, sheet_data: ET.Element, after_row: int,
+                model_row: int) -> int:
+    """
+    Fuegt direkt unter `after_row` eine leere Zeile ein (Stil und
+    Zellverbunde von `model_row` uebernommen); alles darunter rutscht nach
+    unten. Gibt die neue Zeilennummer zurueck.
+    """
+    at = after_row + 1
+    m = lambda tag: f"{{{MAIN_NS}}}{tag}"  # noqa: E731
+
+    model_el = None
+    for row_el in sheet_data.findall(m("row")):
+        r = int(row_el.get("r"))
+        if r == model_row:
+            model_el = row_el
+        if r >= at:
+            row_el.set("r", str(r + 1))
+            for c in row_el.findall(m("c")):
+                col_s, _ = split_coord(c.get("r"))
+                c.set("r", f"{col_s}{r + 1}")
+
+    new_row = ET.Element(m("row"), {"r": str(at)})
+    if model_el is not None:
+        for k, v in model_el.attrib.items():
+            if k != "r":
+                new_row.set(k, v)
+        for c in model_el.findall(m("c")):
+            col_s, _ = split_coord(c.get("r"))
+            nc = ET.SubElement(new_row, m("c"), {"r": f"{col_s}{at}"})
+            if c.get("s"):
+                nc.set("s", c.get("s"))
+    children = list(sheet_data)
+    pos = next((i for i, e in enumerate(children)
+                if int(e.get("r")) > at), len(children))
+    sheet_data.insert(pos, new_row)
+
+    mc = root.find(m("mergeCells"))
+    if mc is not None:
+        clones = []
+        for mcell in mc.findall(m("mergeCell")):
+            ref = mcell.get("ref", "")
+            if ":" in ref:
+                (c1, r1), (c2, r2) = (split_coord(x) for x in ref.split(":"))
+                if r1 == r2 == model_row:
+                    clones.append(f"{c1}{at}:{c2}{at}")
+            mcell.set("ref", _shift_rows_in_ref(ref, at))
+        for ref in clones:
+            ET.SubElement(mc, m("mergeCell"), {"ref": ref})
+        mc.set("count", str(len(mc.findall(m("mergeCell")))))
+
+    dim = root.find(m("dimension"))
+    if dim is not None and dim.get("ref"):
+        dim.set("ref", _shift_rows_in_ref(dim.get("ref"), at))
+    for tag, attr in (("conditionalFormatting", "sqref"),
+                      ("dataValidation", "sqref"), ("hyperlink", "ref")):
+        for el in root.iter(m(tag)):
+            if el.get(attr):
+                el.set(attr, _shift_rows_in_ref(el.get(attr), at))
+    for brk in root.iter(m("brk")):
+        if brk.get("id") and int(brk.get("id")) >= at:
+            brk.set("id", str(int(brk.get("id")) + 1))
+    return at
+
+
+def _shift_print_area(wb_xml: str, at: int) -> str:
+    """Zieht Druckbereiche in workbook.xml bei einer eingefuegten Zeile nach."""
+    def fix(m):
+        return m.group(1) + _shift_rows_in_ref(m.group(2), at) + m.group(3)
+    return re.sub(
+        r'(<definedName[^>]*name="_xlnm\.Print_Area"[^>]*>)([^<]*)(</definedName>)',
+        fix, wb_xml)
+
+
+def _shift_for_inserts(coord: str, inserted: list[int]) -> str:
+    col_s, row = split_coord(coord)
+    for at in sorted(inserted):
+        if at <= row:
+            row += 1
+    return f"{col_s}{row}"
+
+
+def _find_insert_position(rule: Rule, texts: dict[str, str]) -> Optional[str]:
+    """Zelle in der Datei, unter deren Zeile das fehlende Feld eingefuegt wird."""
+    base_row, _ = coord_key(rule.coord)
+    for ctx in rule.context_above:
+        cands = [c for c, t in texts.items() if norm_text(t) == norm_text(ctx)]
+        if cands:
+            cands.sort(key=lambda c: abs(coord_key(c)[0] - base_row))
+            return cands[0]
+    return None
+
+
+def _similar_cell(rule: Rule, texts: dict[str, str],
+                  anchor_of: dict[str, str]) -> Optional[str]:
+    """Aehnlichster Text in derselben Spalte (z. B. 'Revision: 002' zu '003')."""
+    if not norm_text(rule.expected):
+        return None
+    col_s, _ = split_coord(rule.coord)
+    best, best_ratio = None, 0.0
+    for c, t in texts.items():
+        if split_coord(c)[0] != col_s:
+            continue
+        ratio = difflib.SequenceMatcher(
+            None, norm_text(t), norm_text(rule.expected)).ratio()
+        if ratio > best_ratio:
+            best, best_ratio = c, ratio
+    return anchor_of.get(best, best) if best and best_ratio >= 0.75 else None
+
+
 def apply_to_file(
     source: str,
     target: str,
@@ -731,18 +896,29 @@ def apply_to_file(
             if sheet_data is None:
                 raise ValueError("sheetData nicht gefunden.")
 
-            cells_by_ref = {
-                c.get("r"): c for c in sheet_data.iter(f"{{{MAIN_NS}}}c")
-            }
-            texts = {
-                ref: t for ref, c in cells_by_ref.items()
-                if (t := _cell_text(c, shared)) and norm_text(t)
-            }
+            cells_by_ref: dict[str, ET.Element] = {}
+            texts: dict[str, str] = {}
+            inserted: list[int] = []
+
+            def refresh_state():
+                nonlocal anchor_of
+                anchor_of = _merge_anchor_map(root)
+                cells_by_ref.clear()
+                cells_by_ref.update(
+                    {c.get("r"): c for c in sheet_data.iter(f"{{{MAIN_NS}}}c")})
+                texts.clear()
+                texts.update({
+                    ref: t for ref, c in cells_by_ref.items()
+                    if (t := _cell_text(c, shared)) and norm_text(t)})
+
+            refresh_state()
 
             via_texts = {
                 "inhalt": "per Zellinhalt gefunden",
                 "anker": "über Beschriftung gefunden",
                 "koordinate": "über Koordinate",
+                "aehnlich": "über ähnlichen Text gefunden",
+                "eingefuegt": "fehlendes Feld neu eingefügt",
             }
 
             for rule in rules:
@@ -751,6 +927,37 @@ def apply_to_file(
                     continue
 
                 coord, via = _resolve_target(rule, texts, anchor_of)
+                if via == "koordinate" and rule.allow_insert:
+                    similar = _similar_cell(rule, texts, anchor_of)
+                    pos = _find_insert_position(rule, texts)
+                    if similar:
+                        coord, via = similar, "aehnlich"
+                    elif pos is None:
+                        result.cells.append(CellResult(
+                            coord=rule.coord, label=rule.label, old="",
+                            new=rule.new, status="uebersprungen",
+                            message="Feld fehlt und Einfügeposition "
+                                    "nicht ermittelbar"))
+                        continue
+                    else:
+                        after = _merge_bottom(root, pos)
+                        at = _insert_row(root, sheet_data, after,
+                                         coord_key(pos)[0])
+                        inserted.append(at)
+                        t_col = idx_to_col(col_to_idx(split_coord(rule.coord)[0]))
+                        if (rule.anchor_text and rule.anchor_coord
+                                and split_coord(rule.anchor_coord)[1]
+                                == split_coord(rule.coord)[1]
+                                and split_coord(rule.anchor_coord)[0] != t_col):
+                            refresh_state()
+                            lab = _find_or_create_cell(
+                                sheet_data, f"{split_coord(rule.anchor_coord)[0]}{at}")
+                            _set_cell_value(lab, rule.anchor_text)
+                        refresh_state()
+                        coord = anchor_of.get(f"{t_col}{at}", f"{t_col}{at}")
+                        via = "eingefuegt"
+                elif via == "koordinate" and inserted:
+                    coord = _shift_for_inserts(coord, inserted)
                 cell = cells_by_ref.get(coord)
                 if cell is None:
                     cell = _find_or_create_cell(sheet_data, coord)
@@ -793,6 +1000,11 @@ def apply_to_file(
                 for item in zin.infolist():
                     if item.filename == sheet_path:
                         zout.writestr(item, new_xml.encode("utf-8"))
+                    elif item.filename == "xl/workbook.xml" and inserted:
+                        wb_xml = zin.read(item.filename).decode("utf-8")
+                        for at in sorted(inserted):
+                            wb_xml = _shift_print_area(wb_xml, at)
+                        zout.writestr(item, wb_xml.encode("utf-8"))
                     else:
                         zout.writestr(item, zin.read(item.filename))
             shutil.move(tmp_target, target)

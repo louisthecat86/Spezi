@@ -648,6 +648,9 @@ def _resolve_target(rule: Rule, texts: dict[str, str],
         d_row = t_row - a_row
         cands = [c for c, t in texts.items()
                  if norm_text(t) == norm_text(rule.anchor_text)]
+        if not cands and _row_key(rule.anchor_text):
+            cands = [c for c, t in texts.items()
+                     if _row_key(t) == _row_key(rule.anchor_text)]
         if cands:
             cands.sort(key=lambda c: (abs(coord_key(c)[0] - a_row),
                                       abs(coord_key(c)[1] - a_col)))
@@ -1019,9 +1022,43 @@ def _delete_rows(root: ET.Element, sheet_data: ET.Element,
             brk.set("id", str(int(brk.get("id")) - n))
 
 
+def _style_sig(cell) -> tuple:
+    f, b, a = cell.font, cell.border, cell.alignment
+    col = lambda c: (c.rgb if c is not None and c.type == "rgb" else  # noqa: E731
+                     (c.theme, c.tint) if c is not None and c.type == "theme" else None)
+    return (f.name, f.sz, f.b, f.i, f.u, col(f.color),
+            cell.fill.patternType, col(cell.fill.fgColor),
+            b.left.style, b.right.style, b.top.style, b.bottom.style,
+            a.horizontal, a.vertical, bool(a.wrap_text), cell.number_format)
+
+
+def _sheet_sigs(path: str, only_styled: bool) -> dict:
+    """Stilsignatur -> s-Index (Datei) bzw. Koordinate -> Signatur (Vorlage)."""
+    wb = openpyxl.load_workbook(path)
+    try:
+        ws = wb.worksheets[0]
+        with zipfile.ZipFile(path) as z:
+            raw = ET.fromstring(z.read(_first_sheet_path(z)))
+        raw_s = {c.get("r"): c.get("s") for c in raw.iter(f"{{{MAIN_NS}}}c")
+                 if c.get("s")}
+        out = {}
+        for row in ws.iter_rows():
+            for c in row:
+                if c.coordinate in raw_s:
+                    sig = _style_sig(c)
+                    if only_styled:
+                        out.setdefault(sig, raw_s[c.coordinate])
+                    else:
+                        out[c.coordinate] = sig
+        return out
+    finally:
+        wb.close()
+
+
 def sync_structure(template_path: str, root: ET.Element,
                    sheet_data: ET.Element, shared: list[str],
-                   shifts: list[tuple[int, int]]) -> list[str]:
+                   shifts: list[tuple[int, int]],
+                   source_path: Optional[str] = None) -> list[str]:
     """
     Gleicht die Zeilen der Spezifikation an die Vorlage an: Zeilen, die nur in
     der Vorlage stehen, werden eingefuegt, abweichende Zeilen getauscht und
@@ -1073,6 +1110,8 @@ def sync_structure(template_path: str, root: ET.Element,
         None, [k for _, k in skeys], [k for _, k in tkeys],
         autojunk=False).get_opcodes()
     notes: list[str] = []
+    t_sigs: Optional[dict] = None
+    sig_to_s: dict = {}
     # von unten nach oben, damit die Zeilennummern oberhalb gueltig bleiben
     for tag, i1, i2, j1, j2 in reversed(ops):
         if tag == "equal":
@@ -1113,6 +1152,16 @@ def sync_structure(template_path: str, root: ET.Element,
                 mc.set("count", str(len(mc.findall(f"{{{MAIN_NS}}}mergeCell"))))
             rows_by_num = {int(r.get("r")): r
                            for r in sheet_data.findall(f"{{{MAIN_NS}}}row")}
+            if t_sigs is None and source_path:
+                t_sigs = _sheet_sigs(template_path, False)
+                sig_to_s = _sheet_sigs(source_path, True)
+            for coord, sig in (t_sigs or {}).items():
+                col_s, r = split_coord(coord)
+                s_id = sig_to_s.get(sig)
+                if t_start <= r <= t_end and s_id:
+                    cell = _find_or_create_cell(
+                        sheet_data, f"{col_s}{r - t_start + s_start}")
+                    cell.set("s", s_id)
             for coord, value in tcells.items():
                 col_s, r = split_coord(coord)
                 if t_start <= r <= t_end:
@@ -1303,7 +1352,7 @@ def apply_to_file(
             shifts: list[tuple[int, int]] = []
             if template:
                 result.structure_notes = sync_structure(
-                    template, root, sheet_data, shared, shifts)
+                    template, root, sheet_data, shared, shifts, source)
                 result.structure_notes += sync_values_and_layout(
                     template, root, sheet_data, shared)
 

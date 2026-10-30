@@ -599,3 +599,19 @@ def test_checkboxes_follow_rule_inserted_row(tmp_path):
     assert res.ok, res.error
     assert any("eingefügt" in c.message for c in res.cells)
     _assert_checkboxes_follow_rows(TPL_DE, out)
+
+
+def test_sync_uebernimmt_festtext_und_umbruch(tmp_path):
+    import re
+    import zipfile
+    from spezismith.engine import apply_to_file, Rule
+    tpl = "templates/vorlage_de.xlsx"
+    spezi = str(tmp_path / "spezi.xlsx")
+    apply_to_file(tpl, spezi, [Rule(coord="C78", new="nichts Vakuum", expected="Vakuum")])
+    out = str(tmp_path / "out.xlsx")
+    res = apply_to_file(spezi, out, [], template=tpl)
+    assert res.ok
+    import openpyxl
+    assert openpyxl.load_workbook(out).worksheets[0]["C78"].value == "Vakuum"
+    xml = zipfile.ZipFile(out).read("xl/worksheets/sheet1.xml").decode()
+    assert re.search(r'<brk id="43"', xml)

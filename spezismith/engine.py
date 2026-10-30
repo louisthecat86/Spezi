@@ -1138,6 +1138,127 @@ def sync_structure(template_path: str, root: ET.Element,
     return notes
 
 
+_VERSION_RE = re.compile(
+    r"revision|version|\brev\b|stand|index|datum|erstellt|ersetzt|supersede|date",
+    re.IGNORECASE)
+_AFTER_ROWBREAKS = ("colBreaks", "customProperties", "cellWatches",
+                    "ignoredErrors", "smartTags", "drawing", "legacyDrawing",
+                    "legacyDrawingHF", "drawingHF", "picture", "oleObjects",
+                    "controls", "webPublishItems", "tableParts", "extLst")
+
+
+def _is_template_text(old: str, new: str) -> bool:
+    """Gleicher Festtext mit anderem Stand (Revision, 'nicht vakuumiert' -> 'vakuumiert')."""
+    if norm_text(old) == norm_text(new) or not norm_text(old):
+        return False
+    if _NUM_RE.match(norm_text(new)):
+        return False
+    if difflib.SequenceMatcher(None, _mask(old), _mask(new)).ratio() < 0.6:
+        return False
+    letters = lambda s: re.sub(r"[^a-zäöüß]+", "", s.lower())  # noqa: E731
+    return letters(old) != letters(new) or bool(_VERSION_RE.search(new))
+
+
+def sync_values_and_layout(template_path: str, root: ET.Element,
+                           sheet_data: ET.Element, shared: list[str]) -> list[str]:
+    """
+    Uebernimmt feste Texte (Revision, Vakuum-Hinweise, Kopf-/Fusszeile) aus der
+    Vorlage in die Spezifikation, ohne Produktdaten zu ueberschreiben, und
+    gleicht Seitenumbrueche sowie Zeilenhoehen gleicher Bloecke an.
+    """
+    m = lambda tag: f"{{{MAIN_NS}}}{tag}"  # noqa: E731
+    wb = openpyxl.load_workbook(template_path, data_only=True)
+    try:
+        tws = wb.worksheets[0]
+        tcells = {c.coordinate: c.value for row in tws.iter_rows() for c in row
+                  if c.value is not None and norm_text(c.value)}
+        t_heights = {r: d.height for r, d in tws.row_dimensions.items() if d.height}
+        t_breaks = [(int(b.id), b.max, b.man) for b in
+                    (tws.row_breaks.brk if tws.row_breaks else []) if b.id]
+        t_hf = {}
+        for part in HF_PARTS:
+            obj = getattr(tws, part)
+            for sec, item in (("L", obj.left), ("C", obj.center), ("R", obj.right)):
+                if item.text:
+                    t_hf[(part, sec)] = hf_display_text(item.text)
+    finally:
+        wb.close()
+
+    cells = {c.get("r"): c for c in sheet_data.iter(m("c"))}
+    stexts = {r: t for r, c in cells.items()
+              if (t := _cell_text(c, shared)) and norm_text(t)}
+    tkeys = _keyed_rows({c: str(v) for c, v in tcells.items()})
+    skeys = _keyed_rows(stexts)
+    sm = difflib.SequenceMatcher(None, [k for _, k in tkeys],
+                                 [k for _, k in skeys], autojunk=False)
+    pairs = [(tkeys[i + k][0], skeys[j + k][0])
+             for i, j, n in sm.get_matching_blocks() for k in range(n)]
+    notes: list[str] = []
+
+    def map_row(r: int) -> int:
+        off = 0
+        for t_r, s_r in pairs:
+            if t_r <= r:
+                off = s_r - t_r
+            else:
+                break
+        return r + off
+
+    changed = 0
+    for coord, value in tcells.items():
+        col_s, r = split_coord(coord)
+        target = f"{col_s}{map_row(r)}"
+        old = stexts.get(target)
+        if old is not None and _is_template_text(old, _plain(value)):
+            _set_cell_value(cells[target], _plain(value))
+            changed += 1
+    if changed:
+        notes.append(f"{changed} feste(r) Text(e) aus der Vorlage übernommen")
+
+    hf_el = root.find(m("headerFooter"))
+    for (part, sec), tdisp in t_hf.items():
+        el = hf_el.find(m(part)) if hf_el is not None else None
+        if el is None or not el.text:
+            continue
+        sections, order = _hf_split_sections(el.text)
+        old_plain = hf_display_text(sections.get(sec, ""))
+        if _is_template_text(old_plain, tdisp):
+            sections[sec], _ = _hf_smart_replace(sections[sec], tdisp)
+            el.text = _hf_join_sections(sections, order)
+            notes.append(f"Kopf-/Fußzeile angepasst ({part}.{sec})")
+
+    rows_by_num = {int(r.get("r")): r for r in sheet_data.findall(m("row"))}
+    for (t_a, s_a), nxt in zip(pairs, pairs[1:] + [None]):
+        if nxt is None:
+            break
+        if nxt[0] - t_a != nxt[1] - s_a:
+            continue
+        for k in range(nxt[0] - t_a):
+            row_el, ht = rows_by_num.get(s_a + k), t_heights.get(t_a + k)
+            if row_el is not None and ht:
+                row_el.set("ht", str(ht))
+                row_el.set("customHeight", "1")
+
+    if t_breaks:
+        rb = root.find(m("rowBreaks"))
+        if rb is None:
+            rb = ET.Element(m("rowBreaks"))
+            kids = list(root)
+            pos = next((i for i, e in enumerate(kids)
+                        if e.tag.split("}")[-1] in _AFTER_ROWBREAKS), len(kids))
+            root.insert(pos, rb)
+        for b in list(rb):
+            rb.remove(b)
+        for bid, bmax, man in t_breaks:
+            attrs = {"id": str(map_row(bid)), "man": "1" if man else "0"}
+            if bmax:
+                attrs["max"] = str(bmax)
+            ET.SubElement(rb, m("brk"), attrs)
+        rb.set("count", str(len(t_breaks)))
+        rb.set("manualBreakCount", str(sum(1 for b in t_breaks if b[2])))
+    return notes
+
+
 def _plain(value) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
@@ -1183,6 +1304,8 @@ def apply_to_file(
             if template:
                 result.structure_notes = sync_structure(
                     template, root, sheet_data, shared, shifts)
+                result.structure_notes += sync_values_and_layout(
+                    template, root, sheet_data, shared)
 
             def refresh_state():
                 nonlocal anchor_of

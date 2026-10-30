@@ -1209,7 +1209,8 @@ def _is_template_text(old: str, new: str) -> bool:
 
 
 def sync_values_and_layout(template_path: str, root: ET.Element,
-                           sheet_data: ET.Element, shared: list[str]) -> list[str]:
+                           sheet_data: ET.Element, shared: list[str],
+                           shifts: list[tuple[int, int]]) -> list[str]:
     """
     Uebernimmt feste Texte (Revision, Vakuum-Hinweise, Kopf-/Fusszeile) aus der
     Vorlage in die Spezifikation, ohne Produktdaten zu ueberschreiben, und
@@ -1219,6 +1220,7 @@ def sync_values_and_layout(template_path: str, root: ET.Element,
     wb = openpyxl.load_workbook(template_path, data_only=True)
     try:
         tws = wb.worksheets[0]
+        tws_max_row = tws.max_row
         tcells = {c.coordinate: c.value for row in tws.iter_rows() for c in row
                   if c.value is not None and norm_text(c.value)}
         t_heights = {r: d.height for r, d in tws.row_dimensions.items() if d.height}
@@ -1243,6 +1245,48 @@ def sync_values_and_layout(template_path: str, root: ET.Element,
     pairs = [(tkeys[i + k][0], skeys[j + k][0])
              for i, j, n in sm.get_matching_blocks() for k in range(n)]
     notes: list[str] = []
+
+    def load_state():
+        nonlocal cells, stexts, skeys, pairs
+        cells = {c.get("r"): c for c in sheet_data.iter(m("c"))}
+        stexts = {r: t for r, c in cells.items()
+                  if (t := _cell_text(c, shared)) and norm_text(t)}
+        skeys = _keyed_rows(stexts)
+        sm = difflib.SequenceMatcher(None, [k for _, k in tkeys],
+                                     [k for _, k in skeys], autojunk=False)
+        pairs = [(tkeys[i + k][0], skeys[j + k][0])
+                 for i, j, n in sm.get_matching_blocks() for k in range(n)]
+
+    # Leerzeilen, die die Vorlage an dieser Stelle nicht hat, entfernen
+    if pairs:
+        t_max = max(tws_max_row, max(r for r, _ in tkeys))
+        s_max = max(int(r.get("r")) for r in sheet_data.findall(m("row")))
+        merges = [tuple(split_coord(x) for x in mc.get("ref").split(":"))
+                  for mc in root.iter(m("mergeCell")) if ":" in mc.get("ref", "")]
+
+        def blank(r: int) -> bool:
+            if any(split_coord(c)[1] == r for c in stexts):
+                return False
+            return all(r1 == r2 == r for (_, r1), (_, r2) in merges
+                       if r1 <= r <= r2)
+
+        removed = 0
+        for idx in range(len(pairs) - 1, -1, -1):
+            t_a, s_a = pairs[idx]
+            t_next, s_next = ((pairs[idx + 1][0], pairs[idx + 1][1])
+                              if idx + 1 < len(pairs) else (t_max + 1, s_max + 1))
+            extra = (s_next - s_a) - (t_next - t_a)
+            r = s_next - 1
+            while extra > 0 and r > s_a:
+                if blank(r):
+                    _delete_rows(root, sheet_data, r, r)
+                    shifts.append((r + 1, -1))
+                    extra -= 1
+                    removed += 1
+                r -= 1
+        if removed:
+            notes.append(f"{removed} überzählige Leerzeile(n) entfernt")
+            load_state()
 
     def map_row(r: int) -> int:
         off = 0
@@ -1354,7 +1398,7 @@ def apply_to_file(
                 result.structure_notes = sync_structure(
                     template, root, sheet_data, shared, shifts, source)
                 result.structure_notes += sync_values_and_layout(
-                    template, root, sheet_data, shared)
+                    template, root, sheet_data, shared, shifts)
 
             def refresh_state():
                 nonlocal anchor_of

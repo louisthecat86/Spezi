@@ -348,6 +348,11 @@ class SheetView(ttk.Frame):
         try:
             ws = wb.worksheets[0]
             max_row, max_col = ws.max_row, ws.max_column
+            used_col = max(
+                [c.column for row in ws.iter_rows() for c in row
+                 if c.value is not None] +
+                [r.max_col for r in ws.merged_cells.ranges] or [max_col])
+            max_col = min(max_col, used_col)
 
             col_px = [ROW_HEADER_W]
             for c in range(1, max_col + 1):

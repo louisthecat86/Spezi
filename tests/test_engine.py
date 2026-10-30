@@ -586,7 +586,8 @@ def test_checkboxes_follow_inserted_rows(tmp_path, insert_at):
     out = tmp_path / "out.xlsx"
     res = apply_to_file(TPL_DE, str(out), [], template=str(tpl))
     assert res.ok, res.error
-    assert len(res.structure_notes) == len(insert_at)
+    assert len([n for n in res.structure_notes
+                if n.startswith("Zeile(n)")]) == len(insert_at)
     _assert_checkboxes_follow_rows(TPL_DE, out)
 
 
